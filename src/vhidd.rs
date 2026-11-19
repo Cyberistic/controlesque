@@ -189,7 +189,7 @@ impl VirtualKeyboardClient {
 
         let socket = UnixDatagram::bind(&client_path)?;
         socket.connect(&server_path)?;
-        socket.set_read_timeout(Some(Duration::from_millis(250)))?;
+        socket.set_read_timeout(Some(Duration::from_secs(3)))?;
 
         if verbose {
             eprintln!(
@@ -205,15 +205,11 @@ impl VirtualKeyboardClient {
         let bg_stop = Arc::clone(&stop);
         let bg_ready = Arc::clone(&keyboard_ready);
 
-        // Background thread: sends periodic heartbeats and reads daemon status responses.
+        // Background thread: sends lightweight heartbeats (every 3s, 15s deadline) and reads responses.
         thread::spawn(move || {
             let mut buf = [0u8; 1024];
-            let mut ticks = 0u32;
             while !bg_stop.load(Ordering::Relaxed) {
-                if ticks % 4 == 0 {
-                    let _ = bg_socket.send(&encode_v5_heartbeat(5000));
-                }
-                ticks = ticks.wrapping_add(1);
+                let _ = bg_socket.send(&encode_v5_heartbeat(15_000));
 
                 match bg_socket.recv(&mut buf) {
                     Ok(n) if n >= 3 && buf[0] == 1 => {
@@ -224,7 +220,7 @@ impl VirtualKeyboardClient {
                         if e.kind() == io::ErrorKind::WouldBlock
                             || e.kind() == io::ErrorKind::TimedOut => {}
                     Err(_) => {
-                        thread::sleep(Duration::from_millis(250));
+                        thread::sleep(Duration::from_secs(1));
                     }
                 }
             }
@@ -243,7 +239,7 @@ impl VirtualKeyboardClient {
 
     fn connect_v7(verbose: bool) -> io::Result<Self> {
         let stream = UnixStream::connect(V7_SERVER_SOCKET)?;
-        stream.set_read_timeout(Some(Duration::from_millis(250)))?;
+        stream.set_read_timeout(Some(Duration::from_secs(5)))?;
         let reader_stream = stream.try_clone()?;
         let writer = Arc::new(Mutex::new(stream));
 
@@ -267,9 +263,9 @@ impl VirtualKeyboardClient {
             let mut ticks = 0u32;
 
             while !bg_stop.load(Ordering::Relaxed) {
-                if ticks % 20 == 0 {
+                if ticks % 2 == 0 {
                     if let Ok(mut w) = bg_writer.lock() {
-                        let _ = w.write_all(&encode_v7_simple_frame(0)); // heartbeat
+                        let _ = w.write_all(&encode_v7_simple_frame(0)); // heartbeat every 10s
                     }
                 }
                 ticks = ticks.wrapping_add(1);

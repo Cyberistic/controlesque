@@ -523,8 +523,14 @@ pub fn run_seize_loop(
 
     let mut last_retry = Instant::now();
     while running.load(Ordering::Relaxed) {
+        // Sleep in the kernel run loop: 5s when idle (0.2 wakeups/s), 2s while awaiting permission.
+        let timeout = if ctx.pending_devices.is_empty() {
+            5.0
+        } else {
+            2.0
+        };
         unsafe {
-            CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0.1, 0);
+            CFRunLoopRunInMode(kCFRunLoopDefaultMode, timeout, 0);
         }
         // Automatically retry seizing devices once Input Monitoring permission is granted.
         if !ctx.pending_devices.is_empty() && last_retry.elapsed() >= Duration::from_secs(2) {

@@ -70,7 +70,19 @@ echo "Logs: /var/log/controlesque.log"
 echo ""
 echo "Active processes:"
 pgrep -fl "Karabiner-VirtualHIDDevice-Daemon|Karabiner-DriverKit-VirtualHIDDevice|controlesque" || true
-echo ""
-echo "Note: If keys are not remapped yet, add /usr/local/bin/controlesque to"
-echo "      System Settings -> Privacy & Security -> Input Monitoring,"
-echo "      then restart with: sudo launchctl kickstart -k system/com.controlesque.daemon"
+
+# Check if Input Monitoring permission is still needed and guide the user directly.
+if tail -n 5 /var/log/controlesque.log 2>/dev/null | grep -q "waiting for Input Monitoring permission"; then
+    echo ""
+    echo "==> One-time macOS permission needed (Input Monitoring):"
+    echo "    Opening System Settings -> Privacy & Security -> Input Monitoring..."
+    if [ -n "${SUDO_USER:-}" ]; then
+        su - "$SUDO_USER" -c 'open "x-apple.systempreferences:com.apple.preference.security?Privacy_ListenEvent"' 2>/dev/null || true
+    else
+        open "x-apple.systempreferences:com.apple.preference.security?Privacy_ListenEvent" 2>/dev/null || true
+    fi
+    echo "    1. Click '+' at the bottom of the list"
+    echo "    2. Press Cmd+Shift+G and enter: /usr/local/bin/controlesque"
+    echo "    3. Add it and make sure its toggle is ON"
+    echo "    (controlesque will automatically seize your keyboard within 2 seconds — no restart needed!)"
+fi

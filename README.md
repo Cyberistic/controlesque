@@ -53,11 +53,17 @@ This compiles the ~350 KB release binary, installs `/usr/local/bin/controlesque`
 
 ### 3. Grant Input Monitoring *(first time only)*
 
-Add `/usr/local/bin/controlesque` in **System Settings → Privacy & Security → Input Monitoring**, then restart:
+`install.sh` automatically opens **Input Monitoring** if permission is needed, or open it directly:
 
 ```bash
-sudo launchctl kickstart -k system/com.controlesque.daemon
+open "x-apple.systempreferences:com.apple.preference.security?Privacy_ListenEvent"
 ```
+
+1. Click **`+`**
+2. Press **`Cmd+Shift+G`** and enter `/usr/local/bin/controlesque`
+3. Add it and ensure its toggle is **ON**
+
+`controlesque` detects the permission and seizes your keyboard automatically within 2 seconds (no restart needed).
 
 ---
 
