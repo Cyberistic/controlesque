@@ -89,16 +89,17 @@ pgrep -fl "Karabiner-VirtualHIDDevice-Daemon|Karabiner-DriverKit-VirtualHIDDevic
 if grep -q "waiting for Input Monitoring permission" /var/log/controlesque.log 2>/dev/null; then
     echo ""
     echo "==> macOS Input Monitoring permission required:"
-    echo "    Opening System Settings -> Privacy & Security -> Input Monitoring..."
+    echo "    Opening Input Monitoring and revealing controlesque.app in Finder..."
     if [ -n "${SUDO_USER:-}" ]; then
         su - "$SUDO_USER" -c 'open "x-apple.systempreferences:com.apple.preference.security?Privacy_ListenEvent"' 2>/dev/null || true
+        su - "$SUDO_USER" -c "open -R '$APP_DIR'" 2>/dev/null || true
     else
         open "x-apple.systempreferences:com.apple.preference.security?Privacy_ListenEvent" 2>/dev/null || true
+        open -R "$APP_DIR" 2>/dev/null || true
     fi
     echo "    1. If an older 'controlesque' entry exists, select it and click '-' to remove it"
-    echo "    2. Click '+', press Cmd+Shift+G, and enter:"
-    echo "       $APP_DIR"
-    echo "    3. Add it and ensure its toggle is ON"
-    echo "    4. Restart the daemon so macOS picks up the new TCC grant:"
+    echo "    2. Drag and drop 'controlesque.app' from Finder into the Input Monitoring list"
+    echo "       (do NOT select Contents/MacOS/controlesque — drag the .app bundle itself)"
+    echo "    3. Ensure its toggle is ON, then restart the daemon:"
     echo "       sudo launchctl kickstart -k system/com.controlesque.daemon"
 fi

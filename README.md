@@ -48,19 +48,21 @@ sudo ./scripts/install.sh
 
 > **Migrating from Karabiner-Elements?** Run `sudo ./scripts/migrate-from-karabiner.sh` first to remove Karabiner-Elements while keeping the DriverKit driver, then run `sudo ./scripts/install.sh`.
 
-### 3. Grant Input Monitoring*
+### 3. Grant Input Monitoring
 
-`install.sh` automatically opens **Input Monitoring** if permission is needed, or open it directly:
+`install.sh` automatically opens **Input Monitoring** and reveals `controlesque.app` in Finder, or run:
 
 ```bash
 open "x-apple.systempreferences:com.apple.preference.security?Privacy_ListenEvent"
+open -R "/Library/Application Support/controlesque/controlesque.app"
 ```
 
 1. *(If upgrading/rebuilding)* Remove any old `controlesque` entry with **`-`**
-2. Click **`+`**, press **`Cmd+Shift+G`**, and enter `/Library/Application Support/controlesque/controlesque.app`
-3. Add it and ensure its toggle is **ON**
-
-`controlesque` detects the permission and seizes your keyboard automatically within 2 seconds (no restart needed).
+2. **Drag and drop `controlesque.app`** from Finder into the Input Monitoring list *(drag the `.app` bundle itself, not the inner binary)*
+3. Ensure its toggle is **ON**, then restart the daemon:
+   ```bash
+   sudo launchctl kickstart -k system/com.controlesque.daemon
+   ```
 
 ---
 
