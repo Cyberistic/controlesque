@@ -63,6 +63,7 @@ const kCFNumberSInt64Type: CFNumberType = 4;
 
 const kIOMainPortDefault: mach_port_t = 0;
 const kIOReturnSuccess: IOReturn = 0;
+const kIOReturnNotPermitted: IOReturn = 0xe000_02e2u32 as i32;
 const kIOHIDOptionsTypeNone: IOOptionBits = 0;
 const kIOHIDOptionsTypeSeizeDevice: IOOptionBits = 1;
 
@@ -272,6 +273,8 @@ struct SeizeContext {
     vhidd: VirtualKeyboardClient,
     /// Map of IOKit RegistryEntryID -> owned `IOHIDDeviceRef`.
     seized_devices: HashMap<u64, IOHIDDeviceRef>,
+    /// Devices waiting for Input Monitoring permission to be granted.
+    pending_devices: HashMap<u64, IOHIDDeviceRef>,
     verbose: bool,
 }
 
@@ -312,7 +315,7 @@ extern "C" fn on_service_matched(refcon: *mut c_void, iterator: io_iterator_t) {
         let mut reg_id: u64 = 0;
         unsafe { IORegistryEntryGetRegistryEntryID(service, &mut reg_id) };
 
-        if ctx.seized_devices.contains_key(&reg_id) {
+        if ctx.seized_devices.contains_key(&reg_id) || ctx.pending_devices.contains_key(&reg_id) {
             unsafe { IOObjectRelease(service) };
             continue;
         }
@@ -338,6 +341,14 @@ extern "C" fn on_service_matched(refcon: *mut c_void, iterator: io_iterator_t) {
         }
 
         let kr = unsafe { IOHIDDeviceOpen(device, kIOHIDOptionsTypeSeizeDevice) };
+        if kr == kIOReturnNotPermitted {
+            eprintln!(
+                "[controlesque] waiting for Input Monitoring permission to seize {product} \
+                 (grant /usr/local/bin/controlesque in System Settings -> Privacy & Security -> Input Monitoring)"
+            );
+            ctx.pending_devices.insert(reg_id, device);
+            continue;
+        }
         if kr != kIOReturnSuccess {
             eprintln!(
                 "[controlesque] failed to seize {product} (0x{vid:04x}:0x{pid:04x}): IOReturn=0x{kr:08x}"
@@ -370,6 +381,10 @@ extern "C" fn on_service_terminated(refcon: *mut c_void, iterator: io_iterator_t
         let mut reg_id: u64 = 0;
         unsafe { IORegistryEntryGetRegistryEntryID(service, &mut reg_id) };
         unsafe { IOObjectRelease(service) };
+
+        if let Some(device) = ctx.pending_devices.remove(&reg_id) {
+            unsafe { CFRelease(device) };
+        }
 
         if let Some(device) = ctx.seized_devices.remove(&reg_id) {
             let product =
@@ -441,6 +456,7 @@ pub fn run_seize_loop(
         remapper: Remapper::new(alone_timeout),
         vhidd,
         seized_devices: HashMap::new(),
+        pending_devices: HashMap::new(),
         verbose,
     });
     let ctx_ptr = (&mut *ctx as *mut SeizeContext).cast::<c_void>();
@@ -505,9 +521,31 @@ pub fn run_seize_loop(
         alone_timeout.as_millis()
     );
 
+    let mut last_retry = Instant::now();
     while running.load(Ordering::Relaxed) {
         unsafe {
             CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0.1, 0);
+        }
+        // Automatically retry seizing devices once Input Monitoring permission is granted.
+        if !ctx.pending_devices.is_empty() && last_retry.elapsed() >= Duration::from_secs(2) {
+            last_retry = Instant::now();
+            let pending_ids: Vec<u64> = ctx.pending_devices.keys().copied().collect();
+            for reg_id in pending_ids {
+                if let Some(&device) = ctx.pending_devices.get(&reg_id) {
+                    let kr = unsafe { IOHIDDeviceOpen(device, kIOHIDOptionsTypeSeizeDevice) };
+                    if kr == kIOReturnSuccess {
+                        ctx.pending_devices.remove(&reg_id);
+                        unsafe {
+                            IOHIDDeviceRegisterInputValueCallback(device, on_input_value, ctx_ptr);
+                            IOHIDDeviceScheduleWithRunLoop(device, run_loop, kCFRunLoopDefaultMode);
+                        }
+                        let product = device_string_prop(device, "Product")
+                            .unwrap_or_else(|| "<unknown>".into());
+                        ctx.seized_devices.insert(reg_id, device);
+                        eprintln!("[controlesque] seized keyboard: {product} (id={reg_id})");
+                    }
+                }
+            }
         }
     }
 
@@ -516,6 +554,10 @@ pub fn run_seize_loop(
     // Release all virtual keys first so nothing is left stuck.
     for report in ctx.remapper.reset_all() {
         let _ = ctx.vhidd.post_report(report);
+    }
+
+    for (_, device) in ctx.pending_devices.drain() {
+        unsafe { CFRelease(device) };
     }
 
     // Unseize every physical keyboard.
