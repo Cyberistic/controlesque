@@ -61,9 +61,10 @@ open "x-apple.systempreferences:com.apple.preference.security?Privacy_ListenEven
 
 1. *(If upgrading/rebuilding)* Remove any old `controlesque` entry with **`-`**
 2. Click **`+`**, press **`Cmd+Shift+G`**, and enter `/Library/Application Support/controlesque/controlesque.app`
-3. Add it and ensure its toggle is **ON**
-
-`controlesque` detects the permission and seizes your keyboard automatically within 2 seconds (no restart needed).
+3. Add it, ensure its toggle is **ON**, and restart the daemon:
+   ```bash
+   sudo launchctl kickstart -k system/com.controlesque.daemon
+   ```
 
 ---
 

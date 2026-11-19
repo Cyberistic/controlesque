@@ -36,8 +36,9 @@ cp "$REPO_DIR/target/release/controlesque" "$APP_DIR/Contents/MacOS/controlesque
 cp "$REPO_DIR/assets/Info.plist" "$APP_DIR/Contents/Info.plist"
 cp "$REPO_DIR/assets/AppIcon.icns" "$APP_DIR/Contents/Resources/AppIcon.icns"
 chmod 755 "$APP_DIR/Contents/MacOS/controlesque"
+xattr -cr "$APP_DIR"
+codesign --force --sign - --identifier com.controlesque.daemon "$APP_DIR"
 chown -R root:wheel "/Library/Application Support/controlesque"
-codesign --force --deep --sign - "$APP_DIR" 2>/dev/null || true
 
 # Symlink into /usr/local/bin so `sudo controlesque` works from the CLI too.
 mkdir -p /usr/local/bin
@@ -98,5 +99,6 @@ if grep -q "waiting for Input Monitoring permission" /var/log/controlesque.log 2
     echo "    2. Click '+', press Cmd+Shift+G, and enter:"
     echo "       $APP_DIR"
     echo "    3. Add it and ensure its toggle is ON"
-    echo "    (controlesque will automatically seize your keyboard within 2 seconds — no restart needed!)"
+    echo "    4. Restart the daemon so macOS picks up the new TCC grant:"
+    echo "       sudo launchctl kickstart -k system/com.controlesque.daemon"
 fi
