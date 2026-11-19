@@ -5,8 +5,7 @@
 <h1 align="center">controlesque</h1>
 
 <p align="center">
-  <strong>Caps Lock → Escape on tap, Left Control on hold.</strong><br/>
-  Zero-dependency macOS HID daemon. No tray icon, no updater, no GUI, ~2 MB RAM.
+  <strong>MacOS Caps Lock → Escape on tap, CTRL on hold.</strong><br/>
 </p>
 
 <p align="center">
@@ -17,21 +16,20 @@
 
 ---
 
-## Why
+if you're on Mac and use vim or require tap to esc and hold to ctrl, then this is for you.
+I got tired of karabiner elements auto updating and showing popups, showing up in my tray, taking up ~100 MB of background services all the time, when all I needed was this seemingly very simple functionality, so I MacGyver'd this to use the same 0-latency method as karabiner and their headless driver. 
 
-Karabiner-Elements is great, but if you only need `Caps Lock` → `Esc`/`Ctrl`, running a tray app, updater, and ~100 MB of background services is overkill.
-
-`controlesque` uses the **exact same OS/kernel-level method** as Karabiner-Elements (not `CGEventTap` hacks, so it works everywhere including Secure Input / password prompts):
 
 - **Input:** Exclusively seizes physical keyboards via IOKit (`IOServiceAddMatchingNotification` → `IOHIDDeviceCreate` → `kIOHIDOptionsTypeSeizeDevice`).
 - **Output:** Talks directly to the standalone [Karabiner-DriverKit-VirtualHIDDevice](https://github.com/pqrs-org/Karabiner-DriverKit-VirtualHIDDevice) daemon over its Unix socket (auto-detects Protocol 5 / v6.x and Protocol 7 / v8.x).
-- **Zero latency chords:** `Left Control` is asserted immediately on Caps Lock down (`Caps+C`, `Caps+[`, `Caps+Click` work instantly); releasing alone within `500ms` emits `Escape`.
 
 ---
 
 ## Install & Auto-Start
 
-### 1. Install the standalone DriverKit driver *(once)*
+Give these instructions to your agent. It does require `sudo` and manually adding the program in Privacy settings -> Input Monitoring -> + -> path to controlesque
+
+### 1. Install the standalone DriverKit driver
 
 Download and install the latest `.pkg` from [Karabiner-DriverKit-VirtualHIDDevice Releases](https://github.com/pqrs-org/Karabiner-DriverKit-VirtualHIDDevice/releases), then activate it:
 
@@ -47,11 +45,10 @@ Allow `pqrs.org` in **System Settings → Privacy & Security**.
 sudo ./scripts/install.sh
 ```
 
-This compiles the ~350 KB release binary, installs a minimal headless app bundle at `/Library/Application Support/controlesque/controlesque.app` (with our keycap icon and a `/usr/local/bin/controlesque` symlink), and registers `launchd` services for both `Karabiner-VirtualHIDDevice-Daemon` and `controlesque`.
 
 > **Migrating from Karabiner-Elements?** Run `sudo ./scripts/migrate-from-karabiner.sh` first to remove Karabiner-Elements while keeping the DriverKit driver, then run `sudo ./scripts/install.sh`.
 
-### 3. Grant Input Monitoring *(first time, or after rebuilding)*
+### 3. Grant Input Monitoring*
 
 `install.sh` automatically opens **Input Monitoring** if permission is needed, or open it directly:
 
@@ -61,10 +58,9 @@ open "x-apple.systempreferences:com.apple.preference.security?Privacy_ListenEven
 
 1. *(If upgrading/rebuilding)* Remove any old `controlesque` entry with **`-`**
 2. Click **`+`**, press **`Cmd+Shift+G`**, and enter `/Library/Application Support/controlesque/controlesque.app`
-3. Add it, ensure its toggle is **ON**, and restart the daemon:
-   ```bash
-   sudo launchctl kickstart -k system/com.controlesque.daemon
-   ```
+3. Add it and ensure its toggle is **ON**
+
+`controlesque` detects the permission and seizes your keyboard automatically within 2 seconds (no restart needed).
 
 ---
 
