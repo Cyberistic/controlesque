@@ -1,16 +1,19 @@
-//! macOS IOKit `IOHIDManager` physical keyboard seizer.
+//! macOS IOKit physical keyboard seizer.
 //!
-//! Uses the exact same OS-level mechanism as Karabiner-Elements:
-//! `IOHIDDeviceOpen(device, kIOHIDOptionsTypeSeizeDevice)` claims physical keyboards
-//! exclusively at the IOKit HID layer (below WindowServer, works in Secure Input),
-//! while skipping Karabiner's own DriverKit virtual keyboard to avoid feedback loops.
+//! Uses the exact same OS-level mechanism as Karabiner-Elements (`pqrs::osx::iokit_hid_manager`):
+//! discovers `IOHIDDevice` services via `IOServiceAddMatchingNotification`, creates standalone
+//! `IOHIDDeviceRef` handles via `IOHIDDeviceCreate`, and opens each physical keyboard exclusively
+//! with `IOHIDDeviceOpen(device, kIOHIDOptionsTypeSeizeDevice)`.
+//!
+//! (Using `IOHIDManagerOpen` with `kIOHIDOptionsTypeNone` would pre-open devices non-exclusively,
+//! preventing a subsequent `kIOHIDOptionsTypeSeizeDevice` open from taking exclusive control.)
 
 #![allow(non_camel_case_types, non_upper_case_globals)]
 
 use crate::hid::HidReport;
 use crate::remap::{Action, Remapper, escape_tap_reports};
 use crate::vhidd::{VIRTUAL_PRODUCT_ID, VIRTUAL_VENDOR_ID, VirtualKeyboardClient};
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::ffi::{CStr, CString, c_char, c_void};
 use std::ptr;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -24,6 +27,7 @@ type CFNumberRef = *const c_void;
 type CFDictionaryRef = *const c_void;
 type CFMutableDictionaryRef = *mut c_void;
 type CFRunLoopRef = *mut c_void;
+type CFRunLoopSourceRef = *mut c_void;
 type CFIndex = isize;
 type CFTypeID = usize;
 type CFStringEncoding = u32;
@@ -31,19 +35,20 @@ type CFNumberType = isize;
 type CFTimeInterval = f64;
 type Boolean = u8;
 
+type mach_port_t = u32;
+type io_object_t = u32;
+type io_service_t = io_object_t;
+type io_registry_entry_t = io_object_t;
+type io_iterator_t = io_object_t;
 type IOReturn = i32;
+type kern_return_t = i32;
 type IOOptionBits = u32;
-type IOHIDManagerRef = *mut c_void;
+type IONotificationPortRef = *mut c_void;
 type IOHIDDeviceRef = *mut c_void;
 type IOHIDValueRef = *const c_void;
 type IOHIDElementRef = *const c_void;
 
-type IOHIDDeviceCallback = extern "C" fn(
-    context: *mut c_void,
-    result: IOReturn,
-    sender: *mut c_void,
-    device: IOHIDDeviceRef,
-);
+type IOServiceMatchingCallback = extern "C" fn(refcon: *mut c_void, iterator: io_iterator_t);
 
 type IOHIDValueCallback = extern "C" fn(
     context: *mut c_void,
@@ -56,6 +61,7 @@ const kCFStringEncodingUTF8: CFStringEncoding = 0x0800_0100;
 const kCFNumberSInt32Type: CFNumberType = 3;
 const kCFNumberSInt64Type: CFNumberType = 4;
 
+const kIOMainPortDefault: mach_port_t = 0;
 const kIOReturnSuccess: IOReturn = 0;
 const kIOHIDOptionsTypeNone: IOOptionBits = 0;
 const kIOHIDOptionsTypeSeizeDevice: IOOptionBits = 1;
@@ -63,9 +69,8 @@ const kIOHIDOptionsTypeSeizeDevice: IOOptionBits = 1;
 #[link(name = "CoreFoundation", kind = "framework")]
 unsafe extern "C" {
     static kCFRunLoopDefaultMode: CFStringRef;
-    static kCFTypeDictionaryKeyCallBacks: c_void;
-    static kCFTypeDictionaryValueCallBacks: c_void;
 
+    fn CFRetain(cf: CFTypeRef) -> CFTypeRef;
     fn CFRelease(cf: CFTypeRef);
     fn CFGetTypeID(cf: CFTypeRef) -> CFTypeID;
     fn CFStringGetTypeID() -> CFTypeID;
@@ -96,13 +101,6 @@ unsafe extern "C" {
         value_ptr: *mut c_void,
     ) -> Boolean;
 
-    fn CFDictionaryCreateMutable(
-        allocator: CFAllocatorRef,
-        capacity: CFIndex,
-        key_callbacks: *const c_void,
-        value_callbacks: *const c_void,
-    ) -> CFMutableDictionaryRef;
-
     fn CFDictionarySetValue(
         the_dict: CFMutableDictionaryRef,
         key: *const c_void,
@@ -110,6 +108,8 @@ unsafe extern "C" {
     );
 
     fn CFRunLoopGetCurrent() -> CFRunLoopRef;
+    fn CFRunLoopAddSource(rl: CFRunLoopRef, source: CFRunLoopSourceRef, mode: CFStringRef);
+    fn CFRunLoopRemoveSource(rl: CFRunLoopRef, source: CFRunLoopSourceRef, mode: CFStringRef);
     fn CFRunLoopRunInMode(
         mode: CFStringRef,
         seconds: CFTimeInterval,
@@ -119,31 +119,28 @@ unsafe extern "C" {
 
 #[link(name = "IOKit", kind = "framework")]
 unsafe extern "C" {
-    fn IOHIDManagerCreate(allocator: CFAllocatorRef, options: IOOptionBits) -> IOHIDManagerRef;
-    fn IOHIDManagerSetDeviceMatching(manager: IOHIDManagerRef, matching: CFDictionaryRef);
-    fn IOHIDManagerRegisterDeviceMatchingCallback(
-        manager: IOHIDManagerRef,
-        callback: IOHIDDeviceCallback,
-        context: *mut c_void,
-    );
-    fn IOHIDManagerRegisterDeviceRemovalCallback(
-        manager: IOHIDManagerRef,
-        callback: IOHIDDeviceCallback,
-        context: *mut c_void,
-    );
-    fn IOHIDManagerScheduleWithRunLoop(
-        manager: IOHIDManagerRef,
-        run_loop: CFRunLoopRef,
-        run_loop_mode: CFStringRef,
-    );
-    fn IOHIDManagerUnscheduleFromRunLoop(
-        manager: IOHIDManagerRef,
-        run_loop: CFRunLoopRef,
-        run_loop_mode: CFStringRef,
-    );
-    fn IOHIDManagerOpen(manager: IOHIDManagerRef, options: IOOptionBits) -> IOReturn;
-    fn IOHIDManagerClose(manager: IOHIDManagerRef, options: IOOptionBits) -> IOReturn;
+    fn IONotificationPortCreate(main_port: mach_port_t) -> IONotificationPortRef;
+    fn IONotificationPortDestroy(notify: IONotificationPortRef);
+    fn IONotificationPortGetRunLoopSource(notify: IONotificationPortRef) -> CFRunLoopSourceRef;
 
+    fn IOServiceMatching(name: *const c_char) -> CFMutableDictionaryRef;
+    fn IOServiceAddMatchingNotification(
+        notify_port: IONotificationPortRef,
+        notification_type: *const c_char,
+        matching: CFDictionaryRef,
+        callback: IOServiceMatchingCallback,
+        ref_con: *mut c_void,
+        notification: *mut io_iterator_t,
+    ) -> kern_return_t;
+
+    fn IOIteratorNext(iterator: io_iterator_t) -> io_object_t;
+    fn IOObjectRelease(object: io_object_t) -> kern_return_t;
+    fn IORegistryEntryGetRegistryEntryID(
+        entry: io_registry_entry_t,
+        entry_id: *mut u64,
+    ) -> kern_return_t;
+
+    fn IOHIDDeviceCreate(allocator: CFAllocatorRef, service: io_service_t) -> IOHIDDeviceRef;
     fn IOHIDDeviceOpen(device: IOHIDDeviceRef, options: IOOptionBits) -> IOReturn;
     fn IOHIDDeviceClose(device: IOHIDDeviceRef, options: IOOptionBits) -> IOReturn;
     fn IOHIDDeviceGetProperty(device: IOHIDDeviceRef, key: CFStringRef) -> CFTypeRef;
@@ -196,6 +193,20 @@ fn cf_number_i32(v: i32) -> CfOwned {
         )
     };
     CfOwned(r)
+}
+
+fn make_keyboard_matching_dict() -> CFMutableDictionaryRef {
+    let class_name = CString::new("IOHIDDevice").unwrap();
+    let dict = unsafe { IOServiceMatching(class_name.as_ptr()) };
+    let page_key = cf_string("DeviceUsagePage");
+    let page_val = cf_number_i32(0x01); // kHIDPage_GenericDesktop
+    let usage_key = cf_string("DeviceUsage");
+    let usage_val = cf_number_i32(0x06); // kHIDUsage_GD_Keyboard
+    unsafe {
+        CFDictionarySetValue(dict, page_key.0, page_val.0);
+        CFDictionarySetValue(dict, usage_key.0, usage_val.0);
+    }
+    dict
 }
 
 fn device_string_prop(device: IOHIDDeviceRef, key: &str) -> Option<String> {
@@ -259,7 +270,8 @@ fn is_karabiner_virtual_keyboard(device: IOHIDDeviceRef) -> bool {
 struct SeizeContext {
     remapper: Remapper,
     vhidd: VirtualKeyboardClient,
-    seized_devices: HashSet<usize>,
+    /// Map of IOKit RegistryEntryID -> owned `IOHIDDeviceRef`.
+    seized_devices: HashMap<u64, IOHIDDeviceRef>,
     verbose: bool,
 }
 
@@ -288,71 +300,97 @@ impl SeizeContext {
     }
 }
 
-extern "C" fn on_device_matched(
-    context: *mut c_void,
-    _result: IOReturn,
-    _sender: *mut c_void,
-    device: IOHIDDeviceRef,
-) {
-    let ctx = unsafe { &mut *context.cast::<SeizeContext>() };
-    let key = device as usize;
-    if ctx.seized_devices.contains(&key) {
-        return;
-    }
+extern "C" fn on_service_matched(refcon: *mut c_void, iterator: io_iterator_t) {
+    let ctx = unsafe { &mut *refcon.cast::<SeizeContext>() };
 
-    let product = device_string_prop(device, "Product").unwrap_or_else(|| "<unknown>".into());
-    let vid = device_i64_prop(device, "VendorID").unwrap_or(0);
-    let pid = device_i64_prop(device, "ProductID").unwrap_or(0);
-
-    if is_karabiner_virtual_keyboard(device) {
-        if ctx.verbose {
-            eprintln!(
-                "[controlesque] skipping virtual keyboard: {product} (0x{vid:04x}:0x{pid:04x})"
-            );
+    loop {
+        let service = unsafe { IOIteratorNext(iterator) };
+        if service == 0 {
+            break;
         }
-        return;
-    }
 
-    let kr = unsafe { IOHIDDeviceOpen(device, kIOHIDOptionsTypeSeizeDevice) };
-    if kr != kIOReturnSuccess {
+        let mut reg_id: u64 = 0;
+        unsafe { IORegistryEntryGetRegistryEntryID(service, &mut reg_id) };
+
+        if ctx.seized_devices.contains_key(&reg_id) {
+            unsafe { IOObjectRelease(service) };
+            continue;
+        }
+
+        let device = unsafe { IOHIDDeviceCreate(ptr::null(), service) };
+        unsafe { IOObjectRelease(service) };
+        if device.is_null() {
+            continue;
+        }
+
+        let product = device_string_prop(device, "Product").unwrap_or_else(|| "<unknown>".into());
+        let vid = device_i64_prop(device, "VendorID").unwrap_or(0);
+        let pid = device_i64_prop(device, "ProductID").unwrap_or(0);
+
+        if is_karabiner_virtual_keyboard(device) {
+            if ctx.verbose {
+                eprintln!(
+                    "[controlesque] skipping virtual keyboard: {product} (0x{vid:04x}:0x{pid:04x})"
+                );
+            }
+            unsafe { CFRelease(device) };
+            continue;
+        }
+
+        let kr = unsafe { IOHIDDeviceOpen(device, kIOHIDOptionsTypeSeizeDevice) };
+        if kr != kIOReturnSuccess {
+            eprintln!(
+                "[controlesque] failed to seize {product} (0x{vid:04x}:0x{pid:04x}): IOReturn=0x{kr:08x}"
+            );
+            unsafe { CFRelease(device) };
+            continue;
+        }
+
+        unsafe {
+            IOHIDDeviceRegisterInputValueCallback(device, on_input_value, refcon);
+            IOHIDDeviceScheduleWithRunLoop(device, CFRunLoopGetCurrent(), kCFRunLoopDefaultMode);
+        }
+
+        ctx.seized_devices.insert(reg_id, device);
         eprintln!(
-            "[controlesque] failed to seize {product} (0x{vid:04x}:0x{pid:04x}): IOReturn=0x{kr:08x}"
+            "[controlesque] seized keyboard: {product} (0x{vid:04x}:0x{pid:04x}, id={reg_id})"
         );
-        return;
     }
-
-    unsafe {
-        IOHIDDeviceRegisterInputValueCallback(device, on_input_value, context);
-        IOHIDDeviceScheduleWithRunLoop(device, CFRunLoopGetCurrent(), kCFRunLoopDefaultMode);
-    }
-
-    ctx.seized_devices.insert(key);
-    eprintln!("[controlesque] seized keyboard: {product} (0x{vid:04x}:0x{pid:04x})");
 }
 
-extern "C" fn on_device_removed(
-    context: *mut c_void,
-    _result: IOReturn,
-    _sender: *mut c_void,
-    device: IOHIDDeviceRef,
-) {
-    let ctx = unsafe { &mut *context.cast::<SeizeContext>() };
-    let key = device as usize;
-    if !ctx.seized_devices.remove(&key) {
-        return;
-    }
+extern "C" fn on_service_terminated(refcon: *mut c_void, iterator: io_iterator_t) {
+    let ctx = unsafe { &mut *refcon.cast::<SeizeContext>() };
 
-    let product = device_string_prop(device, "Product").unwrap_or_else(|| "<unknown>".into());
-    eprintln!("[controlesque] keyboard removed: {product}");
+    loop {
+        let service = unsafe { IOIteratorNext(iterator) };
+        if service == 0 {
+            break;
+        }
 
-    unsafe {
-        IOHIDDeviceUnscheduleFromRunLoop(device, CFRunLoopGetCurrent(), kCFRunLoopDefaultMode);
-        IOHIDDeviceClose(device, kIOHIDOptionsTypeNone);
-    }
+        let mut reg_id: u64 = 0;
+        unsafe { IORegistryEntryGetRegistryEntryID(service, &mut reg_id) };
+        unsafe { IOObjectRelease(service) };
 
-    // Clear any keys that may have been held when the keyboard disconnected.
-    for report in ctx.remapper.reset_all() {
-        let _ = ctx.vhidd.post_report(report);
+        if let Some(device) = ctx.seized_devices.remove(&reg_id) {
+            let product =
+                device_string_prop(device, "Product").unwrap_or_else(|| "<unknown>".into());
+            eprintln!("[controlesque] keyboard removed: {product} (id={reg_id})");
+
+            unsafe {
+                IOHIDDeviceUnscheduleFromRunLoop(
+                    device,
+                    CFRunLoopGetCurrent(),
+                    kCFRunLoopDefaultMode,
+                );
+                IOHIDDeviceClose(device, kIOHIDOptionsTypeNone);
+                CFRelease(device);
+            }
+
+            // Clear any keys that may have been held when the keyboard disconnected.
+            for report in ctx.remapper.reset_all() {
+                let _ = ctx.vhidd.post_report(report);
+            }
+        }
     }
 }
 
@@ -392,7 +430,7 @@ extern "C" fn on_input_value(
     }
 }
 
-/// Run the IOKit HID run loop until `running` becomes `false`.
+/// Run the IOKit HID seize loop until `running` becomes `false`.
 pub fn run_seize_loop(
     vhidd: VirtualKeyboardClient,
     alone_timeout: Duration,
@@ -402,50 +440,64 @@ pub fn run_seize_loop(
     let mut ctx = Box::new(SeizeContext {
         remapper: Remapper::new(alone_timeout),
         vhidd,
-        seized_devices: HashSet::new(),
+        seized_devices: HashMap::new(),
         verbose,
     });
     let ctx_ptr = (&mut *ctx as *mut SeizeContext).cast::<c_void>();
 
-    let manager = unsafe { IOHIDManagerCreate(ptr::null(), kIOHIDOptionsTypeNone) };
-    if manager.is_null() {
-        return Err("IOHIDManagerCreate returned null".into());
+    let notify_port = unsafe { IONotificationPortCreate(kIOMainPortDefault) };
+    if notify_port.is_null() {
+        return Err("IONotificationPortCreate returned null".into());
     }
 
-    // Match Generic Desktop (0x01) / Keyboard (0x06) devices.
-    let dict = unsafe {
-        CFDictionaryCreateMutable(
-            ptr::null(),
-            2,
-            &kCFTypeDictionaryKeyCallBacks,
-            &kCFTypeDictionaryValueCallBacks,
+    let run_loop = unsafe { CFRunLoopGetCurrent() };
+    let run_loop_source = unsafe { IONotificationPortGetRunLoopSource(notify_port) };
+    unsafe { CFRunLoopAddSource(run_loop, run_loop_source, kCFRunLoopDefaultMode) };
+
+    let dict = make_keyboard_matching_dict();
+    // IOServiceAddMatchingNotification consumes one reference per call, so retain once.
+    unsafe { CFRetain(dict.cast::<c_void>()) };
+
+    let matched_type = CString::new("IOServiceFirstMatch").unwrap();
+    let terminated_type = CString::new("IOServiceTerminate").unwrap();
+
+    let mut matched_iter: io_iterator_t = 0;
+    let mut terminated_iter: io_iterator_t = 0;
+
+    let kr_match = unsafe {
+        IOServiceAddMatchingNotification(
+            notify_port,
+            matched_type.as_ptr(),
+            dict.cast::<c_void>(),
+            on_service_matched,
+            ctx_ptr,
+            &mut matched_iter,
         )
     };
-    let page_key = cf_string("DeviceUsagePage");
-    let page_val = cf_number_i32(0x01);
-    let usage_key = cf_string("DeviceUsage");
-    let usage_val = cf_number_i32(0x06);
-    unsafe {
-        CFDictionarySetValue(dict, page_key.0, page_val.0);
-        CFDictionarySetValue(dict, usage_key.0, usage_val.0);
-        IOHIDManagerSetDeviceMatching(manager, dict);
-        CFRelease(dict);
-    }
+    let kr_term = unsafe {
+        IOServiceAddMatchingNotification(
+            notify_port,
+            terminated_type.as_ptr(),
+            dict.cast::<c_void>(),
+            on_service_terminated,
+            ctx_ptr,
+            &mut terminated_iter,
+        )
+    };
 
-    unsafe {
-        IOHIDManagerRegisterDeviceMatchingCallback(manager, on_device_matched, ctx_ptr);
-        IOHIDManagerRegisterDeviceRemovalCallback(manager, on_device_removed, ctx_ptr);
-        IOHIDManagerScheduleWithRunLoop(manager, CFRunLoopGetCurrent(), kCFRunLoopDefaultMode);
-    }
-
-    let kr = unsafe { IOHIDManagerOpen(manager, kIOHIDOptionsTypeNone) };
-    if kr != kIOReturnSuccess {
-        unsafe { CFRelease(manager) };
+    if kr_match != kIOReturnSuccess || kr_term != kIOReturnSuccess {
+        unsafe {
+            CFRunLoopRemoveSource(run_loop, run_loop_source, kCFRunLoopDefaultMode);
+            IONotificationPortDestroy(notify_port);
+        }
         return Err(format!(
-            "IOHIDManagerOpen failed (IOReturn=0x{kr:08x}). \
-             Grant Input Monitoring permission and run with sudo."
+            "IOServiceAddMatchingNotification failed (match=0x{kr_match:08x}, term=0x{kr_term:08x})"
         ));
     }
+
+    // Drain initial iterators to seize already-attached keyboards and arm hot-plug notifications.
+    on_service_matched(ctx_ptr, matched_iter);
+    on_service_terminated(ctx_ptr, terminated_iter);
 
     eprintln!(
         "[controlesque] running (protocol {:?}, tap timeout {}ms). Press Ctrl+C to stop.",
@@ -467,18 +519,19 @@ pub fn run_seize_loop(
     }
 
     // Unseize every physical keyboard.
-    for device_addr in ctx.seized_devices.drain() {
-        let device = device_addr as IOHIDDeviceRef;
+    for (_, device) in ctx.seized_devices.drain() {
         unsafe {
-            IOHIDDeviceUnscheduleFromRunLoop(device, CFRunLoopGetCurrent(), kCFRunLoopDefaultMode);
+            IOHIDDeviceUnscheduleFromRunLoop(device, run_loop, kCFRunLoopDefaultMode);
             IOHIDDeviceClose(device, kIOHIDOptionsTypeNone);
+            CFRelease(device);
         }
     }
 
     unsafe {
-        IOHIDManagerUnscheduleFromRunLoop(manager, CFRunLoopGetCurrent(), kCFRunLoopDefaultMode);
-        IOHIDManagerClose(manager, kIOHIDOptionsTypeNone);
-        CFRelease(manager);
+        IOObjectRelease(matched_iter);
+        IOObjectRelease(terminated_iter);
+        CFRunLoopRemoveSource(run_loop, run_loop_source, kCFRunLoopDefaultMode);
+        IONotificationPortDestroy(notify_port);
     }
 
     Ok(())
