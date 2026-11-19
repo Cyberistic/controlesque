@@ -26,16 +26,25 @@ for proc in \
     killall "$proc" 2>/dev/null || true
 done
 
-echo "==> 2. Installing standalone LaunchDaemon for Karabiner-VirtualHIDDevice-Daemon..."
+echo "==> 2. Disabling legacy Karabiner SMAppService daemons & installing standalone vhidd LaunchDaemon..."
+for svc in \
+    org.pqrs.service.daemon.Karabiner-Core-Service \
+    org.pqrs.service.daemon.karabiner_grabber \
+    org.pqrs.service.daemon.Karabiner-VirtualHIDDevice-Daemon; do
+    launchctl bootout "system/$svc" 2>/dev/null || true
+    launchctl disable "system/$svc" 2>/dev/null || true
+done
+
 cp "$REPO_DIR/launchd/org.pqrs.karabiner-virtualhiddevice-daemon.plist" \
    /Library/LaunchDaemons/org.pqrs.karabiner-virtualhiddevice-daemon.plist
 chown root:wheel /Library/LaunchDaemons/org.pqrs.karabiner-virtualhiddevice-daemon.plist
 chmod 644 /Library/LaunchDaemons/org.pqrs.karabiner-virtualhiddevice-daemon.plist
 
-# Restart vhidd under our standalone LaunchDaemon so it survives without Karabiner-Elements.
+# Restart vhidd under our single standalone LaunchDaemon so two instances don't fight over the socket.
 killall Karabiner-VirtualHIDDevice-Daemon 2>/dev/null || true
 launchctl bootout system /Library/LaunchDaemons/org.pqrs.karabiner-virtualhiddevice-daemon.plist 2>/dev/null || true
 launchctl bootstrap system /Library/LaunchDaemons/org.pqrs.karabiner-virtualhiddevice-daemon.plist
+sleep 1
 
 echo "==> 3. Installing /usr/local/bin/controlesque..."
 mkdir -p /usr/local/bin
