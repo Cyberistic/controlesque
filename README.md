@@ -11,7 +11,7 @@ No menu bar tray icon, no auto-updater, no GUI, no JSON rule engine, no Electron
 
 `controlesque` does **not** use `CGEventTap` or WindowServer-level event interception (which break in Secure Input / password prompts). It uses the exact same two-layer OS/HID architecture as [Karabiner-Elements](https://github.com/pqrs-org/Karabiner-Elements):
 
-1. **Input (IOKit HID Seize):** Uses macOS `IOKit` (`IOHIDManager` + `IOHIDDeviceOpen(..., kIOHIDOptionsTypeSeizeDevice)`) to claim physical keyboards exclusively at the HID layer while skipping the virtual keyboard.
+1. **Input (IOKit Exclusive HID Seize):** Discovers `IOHIDDevice` keyboards via `IOServiceAddMatchingNotification`, creates standalone `IOHIDDeviceRef` handles via `IOHIDDeviceCreate`, and opens each physical keyboard exclusively with `IOHIDDeviceOpen(..., kIOHIDOptionsTypeSeizeDevice)` (skipping the virtual keyboard).
 2. **Output (DriverKit Virtual HID Keyboard):** Speaks directly to the standalone [Karabiner-DriverKit-VirtualHIDDevice](https://github.com/pqrs-org/Karabiner-DriverKit-VirtualHIDDevice) daemon over its local Unix domain socket (auto-detects both Protocol 5 / v6.x datagram and Protocol 7 / v8.x stream). Because Apple requires a signed DriverKit entitlement to publish a virtual HID keyboard on SIP-enabled macOS, the standalone DriverKit extension + daemon is the smallest possible OS-level output primitive.
 
 All other keys — including standard modifiers, media/consumer keys, Apple `Fn`/Globe, brightness, Mission Control, and Spotlight — are forwarded transparently.
@@ -25,11 +25,11 @@ All other keys — including standard modifiers, media/consumer keys, Apple `Fn`
 
 ---
 
-## Installation
+## Quick Install & Auto-Start
 
-### 1. Install the standalone DriverKit virtual HID driver
+### Step 1: Ensure the standalone DriverKit virtual HID driver is installed
 
-> If you are migrating away from Karabiner-Elements, uninstall Karabiner-Elements first (via **Karabiner-Elements Settings → Uninstall**), then install the standalone driver package below so you no longer have the tray app, updater, or background services.
+*(Skip this step if you already have `Karabiner-DriverKit-VirtualHIDDevice` installed and activated.)*
 
 1. Download and install the latest `.pkg` from [pqrs-org/Karabiner-DriverKit-VirtualHIDDevice Releases](https://github.com/pqrs-org/Karabiner-DriverKit-VirtualHIDDevice/releases).
 2. Activate the DriverKit system extension:
@@ -37,40 +37,48 @@ All other keys — including standard modifiers, media/consumer keys, Apple `Fn`
    sudo /Applications/.Karabiner-VirtualHIDDevice-Manager.app/Contents/MacOS/Karabiner-VirtualHIDDevice-Manager activate
    ```
 3. Open **System Settings → Privacy & Security** and click **Allow** for the system extension from `pqrs.org`.
-4. Verify it is active:
-   ```bash
-   systemextensionsctl list
-   ```
-   You should see `org.pqrs.Karabiner-DriverKit-VirtualHIDDevice` as `[activated enabled]`.
 
-### 2. Build and install `controlesque`
-
-Requires Rust (`cargo`). No external crates are fetched or compiled.
+### Step 2: Build, install, and enable auto-start on boot
 
 ```bash
-cargo build --release
-sudo cp target/release/controlesque /usr/local/bin/controlesque
+sudo ./scripts/install.sh
 ```
 
-### 3. Grant Input Monitoring permission
+This single script:
+- Compiles the zero-dependency release binary (`cargo build --release`)
+- Installs `/usr/local/bin/controlesque`
+- Disables any conflicting legacy Karabiner-Elements daemons
+- Installs and starts LaunchDaemons for both `Karabiner-VirtualHIDDevice-Daemon` and `controlesque` so they start immediately and automatically on every boot
 
-Open **System Settings → Privacy & Security → Input Monitoring** and add `/usr/local/bin/controlesque` (and your terminal app if testing interactively).
+### Step 3: Grant Input Monitoring permission (first time only)
+
+Open **System Settings → Privacy & Security → Input Monitoring**, add `/usr/local/bin/controlesque`, and restart the daemon:
+
+```bash
+sudo launchctl kickstart -k system/com.controlesque.daemon
+```
+
+Check logs anytime with:
+
+```bash
+tail -f /var/log/controlesque.log
+```
 
 ---
 
-## Usage
+## Migrating from Karabiner-Elements
 
-### Run interactively (for testing)
-
-Make sure `Karabiner-VirtualHIDDevice-Daemon` is running, then run:
+If you currently have Karabiner-Elements installed and want to uninstall it while keeping the DriverKit virtual HID driver and testing `controlesque` interactively:
 
 ```bash
-sudo controlesque --verbose
+sudo ./scripts/migrate-from-karabiner.sh
 ```
 
-Press `Ctrl+C` to stop cleanly (all keys are released and physical keyboards are unseized automatically).
+Once verified, press `Ctrl+C` and run `sudo ./scripts/install.sh` to enable auto-start at boot.
 
-### CLI Options
+---
+
+## Usage (Interactive / CLI)
 
 ```text
 USAGE:
@@ -84,47 +92,20 @@ OPTIONS:
     -V, --version        Show version
 ```
 
-### Run automatically at boot (`launchd`)
-
-Install the two included LaunchDaemons (`Karabiner-VirtualHIDDevice-Daemon` + `controlesque`):
-
-```bash
-sudo cp launchd/org.pqrs.karabiner-virtualhiddevice-daemon.plist /Library/LaunchDaemons/
-sudo cp launchd/com.controlesque.daemon.plist /Library/LaunchDaemons/
-
-sudo chown root:wheel /Library/LaunchDaemons/org.pqrs.karabiner-virtualhiddevice-daemon.plist \
-                      /Library/LaunchDaemons/com.controlesque.daemon.plist
-sudo chmod 644 /Library/LaunchDaemons/org.pqrs.karabiner-virtualhiddevice-daemon.plist \
-               /Library/LaunchDaemons/com.controlesque.daemon.plist
-
-sudo launchctl bootstrap system /Library/LaunchDaemons/org.pqrs.karabiner-virtualhiddevice-daemon.plist
-sudo launchctl bootstrap system /Library/LaunchDaemons/com.controlesque.daemon.plist
-```
-
-Check logs:
-
-```bash
-tail -f /var/log/controlesque.log
-```
-
 ---
 
 ## Uninstall
 
+Remove `controlesque` and its LaunchDaemons:
+
 ```bash
-sudo launchctl bootout system /Library/LaunchDaemons/com.controlesque.daemon.plist
-sudo launchctl bootout system /Library/LaunchDaemons/org.pqrs.karabiner-virtualhiddevice-daemon.plist
-sudo rm -f /Library/LaunchDaemons/com.controlesque.daemon.plist \
-           /Library/LaunchDaemons/org.pqrs.karabiner-virtualhiddevice-daemon.plist \
-           /usr/local/bin/controlesque \
-           /var/log/controlesque.log
+sudo ./scripts/uninstall.sh
 ```
 
-To also remove the DriverKit extension:
+To also deactivate and remove `Karabiner-DriverKit-VirtualHIDDevice`:
 
 ```bash
-sudo bash '/Library/Application Support/org.pqrs/Karabiner-DriverKit-VirtualHIDDevice/scripts/uninstall/deactivate_driver.sh'
-sudo rm -rf "/Library/Application Support/org.pqrs" "/Applications/.Karabiner-VirtualHIDDevice-Manager.app"
+sudo ./scripts/uninstall.sh --with-driver
 ```
 
 ## License
