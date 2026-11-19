@@ -47,11 +47,11 @@ Allow `pqrs.org` in **System Settings → Privacy & Security**.
 sudo ./scripts/install.sh
 ```
 
-This compiles the ~350 KB release binary, installs `/usr/local/bin/controlesque`, and registers `launchd` services for both `Karabiner-VirtualHIDDevice-Daemon` and `controlesque`.
+This compiles the ~350 KB release binary, installs a minimal headless app bundle at `/Library/Application Support/controlesque/controlesque.app` (with our keycap icon and a `/usr/local/bin/controlesque` symlink), and registers `launchd` services for both `Karabiner-VirtualHIDDevice-Daemon` and `controlesque`.
 
 > **Migrating from Karabiner-Elements?** Run `sudo ./scripts/migrate-from-karabiner.sh` first to remove Karabiner-Elements while keeping the DriverKit driver, then run `sudo ./scripts/install.sh`.
 
-### 3. Grant Input Monitoring *(first time only)*
+### 3. Grant Input Monitoring *(first time, or after rebuilding)*
 
 `install.sh` automatically opens **Input Monitoring** if permission is needed, or open it directly:
 
@@ -59,8 +59,8 @@ This compiles the ~350 KB release binary, installs `/usr/local/bin/controlesque`
 open "x-apple.systempreferences:com.apple.preference.security?Privacy_ListenEvent"
 ```
 
-1. Click **`+`**
-2. Press **`Cmd+Shift+G`** and enter `/usr/local/bin/controlesque`
+1. *(If upgrading/rebuilding)* Remove any old `controlesque` entry with **`-`**
+2. Click **`+`**, press **`Cmd+Shift+G`**, and enter `/Library/Application Support/controlesque/controlesque.app`
 3. Add it and ensure its toggle is **ON**
 
 `controlesque` detects the permission and seizes your keyboard automatically within 2 seconds (no restart needed).

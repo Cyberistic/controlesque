@@ -344,7 +344,7 @@ extern "C" fn on_service_matched(refcon: *mut c_void, iterator: io_iterator_t) {
         if kr == kIOReturnNotPermitted {
             eprintln!(
                 "[controlesque] waiting for Input Monitoring permission to seize {product} \
-                 (grant /usr/local/bin/controlesque in System Settings -> Privacy & Security -> Input Monitoring)"
+                 (grant controlesque.app in System Settings -> Privacy & Security -> Input Monitoring)"
             );
             ctx.pending_devices.insert(reg_id, device);
             continue;

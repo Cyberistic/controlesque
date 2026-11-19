@@ -6,7 +6,7 @@
     <string>com.controlesque.daemon</string>
     <key>ProgramArguments</key>
     <array>
-        <string>/usr/local/bin/controlesque</string>
+        <string>/Library/Application Support/controlesque/controlesque.app/Contents/MacOS/controlesque</string>
     </array>
     <key>RunAtLoad</key>
     <true/>

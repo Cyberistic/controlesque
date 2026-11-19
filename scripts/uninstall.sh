@@ -24,8 +24,8 @@ done
 killall controlesque 2>/dev/null || true
 killall Karabiner-VirtualHIDDevice-Daemon 2>/dev/null || true
 
-echo "==> Removing /usr/local/bin/controlesque and logs..."
-rm -f /usr/local/bin/controlesque /var/log/controlesque.log
+echo "==> Removing controlesque bundle, symlink, and logs..."
+rm -rf "/Library/Application Support/controlesque" /usr/local/bin/controlesque /var/log/controlesque.log
 
 if [ "$WITH_DRIVER" -eq 1 ]; then
     echo "==> Deactivating and removing Karabiner-DriverKit-VirtualHIDDevice..."

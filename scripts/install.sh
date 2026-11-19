@@ -8,6 +8,7 @@ fi
 
 REPO_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 VHIDD_BIN="/Library/Application Support/org.pqrs/Karabiner-DriverKit-VirtualHIDDevice/Applications/Karabiner-VirtualHIDDevice-Daemon.app/Contents/MacOS/Karabiner-VirtualHIDDevice-Daemon"
+APP_DIR="/Library/Application Support/controlesque/controlesque.app"
 
 if [ ! -x "$VHIDD_BIN" ]; then
     echo "error: Karabiner-DriverKit-VirtualHIDDevice is not installed."
@@ -28,10 +29,19 @@ else
     (cd "$REPO_DIR" && cargo build --release)
 fi
 
-echo "==> 2. Installing /usr/local/bin/controlesque..."
+echo "==> 2. Installing headless app bundle ($APP_DIR)..."
+rm -rf "$APP_DIR"
+mkdir -p "$APP_DIR/Contents/MacOS" "$APP_DIR/Contents/Resources"
+cp "$REPO_DIR/target/release/controlesque" "$APP_DIR/Contents/MacOS/controlesque"
+cp "$REPO_DIR/assets/Info.plist" "$APP_DIR/Contents/Info.plist"
+cp "$REPO_DIR/assets/AppIcon.icns" "$APP_DIR/Contents/Resources/AppIcon.icns"
+chmod 755 "$APP_DIR/Contents/MacOS/controlesque"
+chown -R root:wheel "/Library/Application Support/controlesque"
+codesign --force --deep --sign - "$APP_DIR" 2>/dev/null || true
+
+# Symlink into /usr/local/bin so `sudo controlesque` works from the CLI too.
 mkdir -p /usr/local/bin
-cp "$REPO_DIR/target/release/controlesque" /usr/local/bin/controlesque
-chmod 755 /usr/local/bin/controlesque
+ln -sf "$APP_DIR/Contents/MacOS/controlesque" /usr/local/bin/controlesque
 
 echo "==> 3. Disabling conflicting Karabiner-Elements daemons (if any)..."
 for svc in \
@@ -59,6 +69,9 @@ install_plist() {
 killall Karabiner-VirtualHIDDevice-Daemon 2>/dev/null || true
 killall controlesque 2>/dev/null || true
 
+# Truncate log so we check fresh startup status below.
+: > /var/log/controlesque.log
+
 install_plist "$REPO_DIR/launchd/org.pqrs.karabiner-virtualhiddevice-daemon.plist"
 sleep 1
 install_plist "$REPO_DIR/launchd/com.controlesque.daemon.plist"
@@ -71,18 +84,19 @@ echo ""
 echo "Active processes:"
 pgrep -fl "Karabiner-VirtualHIDDevice-Daemon|Karabiner-DriverKit-VirtualHIDDevice|controlesque" || true
 
-# Check if Input Monitoring permission is still needed and guide the user directly.
-if tail -n 5 /var/log/controlesque.log 2>/dev/null | grep -q "waiting for Input Monitoring permission"; then
+# Check if Input Monitoring permission is needed (first install, or after rebuilding the binary).
+if grep -q "waiting for Input Monitoring permission" /var/log/controlesque.log 2>/dev/null; then
     echo ""
-    echo "==> One-time macOS permission needed (Input Monitoring):"
+    echo "==> macOS Input Monitoring permission required:"
     echo "    Opening System Settings -> Privacy & Security -> Input Monitoring..."
     if [ -n "${SUDO_USER:-}" ]; then
         su - "$SUDO_USER" -c 'open "x-apple.systempreferences:com.apple.preference.security?Privacy_ListenEvent"' 2>/dev/null || true
     else
         open "x-apple.systempreferences:com.apple.preference.security?Privacy_ListenEvent" 2>/dev/null || true
     fi
-    echo "    1. Click '+' at the bottom of the list"
-    echo "    2. Press Cmd+Shift+G and enter: /usr/local/bin/controlesque"
-    echo "    3. Add it and make sure its toggle is ON"
+    echo "    1. If an older 'controlesque' entry exists, select it and click '-' to remove it"
+    echo "    2. Click '+', press Cmd+Shift+G, and enter:"
+    echo "       $APP_DIR"
+    echo "    3. Add it and ensure its toggle is ON"
     echo "    (controlesque will automatically seize your keyboard within 2 seconds — no restart needed!)"
 fi
