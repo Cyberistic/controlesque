@@ -10,7 +10,7 @@
 
 <p align="center">
   <img src="https://img.shields.io/badge/platform-macOS-000000?style=flat-square" alt="macOS" />
-  <img src="https://img.shields.io/badge/rust-0%20deps-f74c00?style=flat-square" alt="Rust btw" />
+  <img src="https://img.shields.io/badge/rust-0%2btw-f74c00?style=flat-square" alt="Rust btw" />
   <img src="https://img.shields.io/badge/license-MIT-38bdf8?style=flat-square" alt="MIT License" />
 </p>
 
