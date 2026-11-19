@@ -1,113 +1,83 @@
-# controlesque
+<p align="center">
+  <img src="assets/logo.svg" width="112" height="112" alt="controlesque logo" />
+</p>
 
-A minimal, zero-dependency Rust daemon for macOS that does one thing and one thing only:
+<h1 align="center">controlesque</h1>
 
-- **Tap Caps Lock** → **Escape**
-- **Hold Caps Lock** (with another key, or for `Ctrl+Click`) → **Left Control**
+<p align="center">
+  <strong>Caps Lock → Escape on tap, Left Control on hold.</strong><br/>
+  Zero-dependency macOS HID daemon. No tray icon, no updater, no GUI, ~2 MB RAM.
+</p>
 
-No menu bar tray icon, no auto-updater, no GUI, no JSON rule engine, no Electron/SwiftUI overhead — a single ~350 KB native binary using ~1–2 MB of RAM.
-
-## How It Works (Same OS/Kernel-Level Method as Karabiner-Elements)
-
-`controlesque` does **not** use `CGEventTap` or WindowServer-level event interception (which break in Secure Input / password prompts). It uses the exact same two-layer OS/HID architecture as [Karabiner-Elements](https://github.com/pqrs-org/Karabiner-Elements):
-
-1. **Input (IOKit Exclusive HID Seize):** Discovers `IOHIDDevice` keyboards via `IOServiceAddMatchingNotification`, creates standalone `IOHIDDeviceRef` handles via `IOHIDDeviceCreate`, and opens each physical keyboard exclusively with `IOHIDDeviceOpen(..., kIOHIDOptionsTypeSeizeDevice)` (skipping the virtual keyboard).
-2. **Output (DriverKit Virtual HID Keyboard):** Speaks directly to the standalone [Karabiner-DriverKit-VirtualHIDDevice](https://github.com/pqrs-org/Karabiner-DriverKit-VirtualHIDDevice) daemon over its local Unix domain socket (auto-detects both Protocol 5 / v6.x datagram and Protocol 7 / v8.x stream). Because Apple requires a signed DriverKit entitlement to publish a virtual HID keyboard on SIP-enabled macOS, the standalone DriverKit extension + daemon is the smallest possible OS-level output primitive.
-
-All other keys — including standard modifiers, media/consumer keys, Apple `Fn`/Globe, brightness, Mission Control, and Spotlight — are forwarded transparently.
-
-### Behavior Details
-
-- Pressing Caps Lock immediately asserts `Left Control`, so fast chords (`Caps+C`, `Caps+[`, `Caps+R`) and `Caps+Click` with a mouse/trackpad work with **zero latency**.
-- Releasing Caps Lock within `--timeout-ms` (default `500ms`) without pressing any other key releases `Left Control` and emits `Escape`.
-- Holding Caps Lock longer than `--timeout-ms` or pressing any other key while it is held suppresses `Escape`.
-- Physically holding real `Left Control` at the same time is tracked independently so releasing Caps Lock never drops a held physical Control key.
+<p align="center">
+  <img src="https://img.shields.io/badge/platform-macOS-000000?style=flat-square" alt="macOS" />
+  <img src="https://img.shields.io/badge/rust-0%20deps-f74c00?style=flat-square" alt="Rust 0 deps" />
+  <img src="https://img.shields.io/badge/license-MIT-38bdf8?style=flat-square" alt="MIT License" />
+</p>
 
 ---
 
-## Quick Install & Auto-Start
+## Why
 
-### Step 1: Ensure the standalone DriverKit virtual HID driver is installed
+Karabiner-Elements is great, but if you only need `Caps Lock` → `Esc`/`Ctrl`, running a tray app, updater, and ~100 MB of background services is overkill.
 
-*(Skip this step if you already have `Karabiner-DriverKit-VirtualHIDDevice` installed and activated.)*
+`controlesque` uses the **exact same OS/kernel-level method** as Karabiner-Elements (not `CGEventTap` hacks, so it works everywhere including Secure Input / password prompts):
 
-1. Download and install the latest `.pkg` from [pqrs-org/Karabiner-DriverKit-VirtualHIDDevice Releases](https://github.com/pqrs-org/Karabiner-DriverKit-VirtualHIDDevice/releases).
-2. Activate the DriverKit system extension:
-   ```bash
-   sudo /Applications/.Karabiner-VirtualHIDDevice-Manager.app/Contents/MacOS/Karabiner-VirtualHIDDevice-Manager activate
-   ```
-3. Open **System Settings → Privacy & Security** and click **Allow** for the system extension from `pqrs.org`.
+- **Input:** Exclusively seizes physical keyboards via IOKit (`IOServiceAddMatchingNotification` → `IOHIDDeviceCreate` → `kIOHIDOptionsTypeSeizeDevice`).
+- **Output:** Talks directly to the standalone [Karabiner-DriverKit-VirtualHIDDevice](https://github.com/pqrs-org/Karabiner-DriverKit-VirtualHIDDevice) daemon over its Unix socket (auto-detects Protocol 5 / v6.x and Protocol 7 / v8.x).
+- **Zero latency chords:** `Left Control` is asserted immediately on Caps Lock down (`Caps+C`, `Caps+[`, `Caps+Click` work instantly); releasing alone within `500ms` emits `Escape`.
 
-### Step 2: Build, install, and enable auto-start on boot
+---
+
+## Install & Auto-Start
+
+### 1. Install the standalone DriverKit driver *(once)*
+
+Download and install the latest `.pkg` from [Karabiner-DriverKit-VirtualHIDDevice Releases](https://github.com/pqrs-org/Karabiner-DriverKit-VirtualHIDDevice/releases), then activate it:
+
+```bash
+sudo /Applications/.Karabiner-VirtualHIDDevice-Manager.app/Contents/MacOS/Karabiner-VirtualHIDDevice-Manager activate
+```
+
+Allow `pqrs.org` in **System Settings → Privacy & Security**.
+
+### 2. Build, install & enable boot auto-start
 
 ```bash
 sudo ./scripts/install.sh
 ```
 
-This single script:
-- Compiles the zero-dependency release binary (`cargo build --release`)
-- Installs `/usr/local/bin/controlesque`
-- Disables any conflicting legacy Karabiner-Elements daemons
-- Installs and starts LaunchDaemons for both `Karabiner-VirtualHIDDevice-Daemon` and `controlesque` so they start immediately and automatically on every boot
+This compiles the ~350 KB release binary, installs `/usr/local/bin/controlesque`, and registers `launchd` services for both `Karabiner-VirtualHIDDevice-Daemon` and `controlesque`.
 
-### Step 3: Grant Input Monitoring permission (first time only)
+> **Migrating from Karabiner-Elements?** Run `sudo ./scripts/migrate-from-karabiner.sh` first to remove Karabiner-Elements while keeping the DriverKit driver, then run `sudo ./scripts/install.sh`.
 
-Open **System Settings → Privacy & Security → Input Monitoring**, add `/usr/local/bin/controlesque`, and restart the daemon:
+### 3. Grant Input Monitoring *(first time only)*
+
+Add `/usr/local/bin/controlesque` in **System Settings → Privacy & Security → Input Monitoring**, then restart:
 
 ```bash
 sudo launchctl kickstart -k system/com.controlesque.daemon
 ```
 
-Check logs anytime with:
-
-```bash
-tail -f /var/log/controlesque.log
-```
-
 ---
 
-## Migrating from Karabiner-Elements
-
-If you currently have Karabiner-Elements installed and want to uninstall it while keeping the DriverKit virtual HID driver and testing `controlesque` interactively:
+## CLI
 
 ```bash
-sudo ./scripts/migrate-from-karabiner.sh
+sudo controlesque [--timeout-ms 500] [--protocol 5|7] [--verbose]
 ```
 
-Once verified, press `Ctrl+C` and run `sudo ./scripts/install.sh` to enable auto-start at boot.
-
----
-
-## Usage (Interactive / CLI)
-
-```text
-USAGE:
-    sudo controlesque [OPTIONS]
-
-OPTIONS:
-    --timeout-ms <MS>    Max tap duration in ms to emit Escape (default: 500)
-    --protocol <5|7>     Force Karabiner VirtualHIDDevice protocol version (default: auto)
-    -v, --verbose        Print virtual driver & device diagnostics
-    -h, --help           Show this help
-    -V, --version        Show version
-```
+Logs (when running via `launchd`): `/var/log/controlesque.log`
 
 ---
 
 ## Uninstall
 
-Remove `controlesque` and its LaunchDaemons:
-
 ```bash
-sudo ./scripts/uninstall.sh
-```
-
-To also deactivate and remove `Karabiner-DriverKit-VirtualHIDDevice`:
-
-```bash
-sudo ./scripts/uninstall.sh --with-driver
+sudo ./scripts/uninstall.sh                # remove controlesque & LaunchDaemons
+sudo ./scripts/uninstall.sh --with-driver  # also remove DriverKit VirtualHIDDevice
 ```
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+[MIT](LICENSE)
