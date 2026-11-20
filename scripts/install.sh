@@ -85,8 +85,21 @@ echo ""
 echo "Active processes:"
 pgrep -fl "Karabiner-VirtualHIDDevice-Daemon|Karabiner-DriverKit-VirtualHIDDevice|controlesque" || true
 
-# Check if Input Monitoring permission is needed (first install, or after rebuilding the binary).
-if grep -q "waiting for Input Monitoring permission" /var/log/controlesque.log 2>/dev/null; then
+# The daemon only reports its verdict after it has connected to vhidd and waited
+# for the virtual keyboard, so poll instead of checking once.
+permission_needed=0
+for _ in $(seq 1 20); do
+    if grep -q "seized keyboard" /var/log/controlesque.log 2>/dev/null; then
+        break
+    fi
+    if grep -q "waiting for Input Monitoring permission" /var/log/controlesque.log 2>/dev/null; then
+        permission_needed=1
+        break
+    fi
+    sleep 1
+done
+
+if [ "$permission_needed" -eq 1 ]; then
     echo ""
     echo "==> macOS Input Monitoring permission required:"
     echo "    Opening Input Monitoring and revealing controlesque.app in Finder..."
@@ -102,4 +115,6 @@ if grep -q "waiting for Input Monitoring permission" /var/log/controlesque.log 2
     echo "       (do NOT select Contents/MacOS/controlesque — drag the .app bundle itself)"
     echo "    3. Ensure its toggle is ON, then restart the daemon:"
     echo "       sudo launchctl kickstart -k system/com.controlesque.daemon"
+    echo ""
+    echo "    The daemon retries every 2s and seizes the keyboard as soon as you grant it."
 fi
