@@ -12,6 +12,15 @@ pub const KEY_CAPS_LOCK: u16 = 0x39;
 pub const KEY_LEFT_CTRL: u16 = 0xE0;
 pub const KEY_RIGHT_GUI: u16 = 0xE7;
 
+/// AppleVendorTopCase usages for the display brightness keys.
+pub const APPLE_TOP_CASE_BRIGHTNESS_UP: u16 = 0x0004;
+pub const APPLE_TOP_CASE_BRIGHTNESS_DOWN: u16 = 0x0005;
+
+/// Consumer-page brightness usages, which macOS accepts from a virtual keyboard.
+/// Karabiner maps the top row to these rather than to the AppleVendorTopCase ones.
+pub const CONSUMER_DISPLAY_BRIGHTNESS_INCREMENT: u16 = 0x006F;
+pub const CONSUMER_DISPLAY_BRIGHTNESS_DECREMENT: u16 = 0x0070;
+
 pub const MOD_LEFT_CTRL: u8 = 1 << 0;
 
 /// Map a Keyboard/Keypad usage (0xE0..=0xE7) to its USB HID modifier bit.

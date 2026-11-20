@@ -22,6 +22,7 @@ I got tired of karabiner elements auto updating and showing popups, showing up i
 
 - **Input:** Exclusively seizes physical keyboards via IOKit (`IOServiceAddMatchingNotification` → `IOHIDDeviceCreate` → `kIOHIDOptionsTypeSeizeDevice`).
 - **Output:** Talks directly to the standalone [Karabiner-DriverKit-VirtualHIDDevice](https://github.com/pqrs-org/Karabiner-DriverKit-VirtualHIDDevice) daemon over its Unix socket (auto-detects Protocol 5 / v6.x and Protocol 7 / v8.x).
+- **Top row:** seizing a keyboard also bypasses the macOS driver that turns F1–F12 into brightness/volume/media keys. Instead of assuming a layout, controlesque replays the tables that driver publishes for that exact keyboard (`FnFunctionUsageMap`, `FnKeyboardUsageMap`), and honors *Use F1, F2, etc. keys as standard function keys* for the `Fn` inversion. Keyboards that publish no such tables keep sending their keys untouched. `Fn`+arrows/Backspace follow the same tables.
 
 ---
 

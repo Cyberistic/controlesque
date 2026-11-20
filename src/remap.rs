@@ -6,10 +6,12 @@
 //! Left Control is asserted immediately on Caps Lock press so chords (`Caps+C`, `Caps+[`)
 //! and `Caps+Click` with a trackpad/mouse have zero latency.
 
+use crate::fnmap::{FnUsageMap, PackedUsage, pack};
 use crate::hid::{
-    AuxiliaryReport, HidReport, KEY_CAPS_LOCK, KEY_ESCAPE, KeyboardReport, MOD_LEFT_CTRL,
-    PAGE_APPLE_VENDOR_KEYBOARD, PAGE_APPLE_VENDOR_TOP_CASE, PAGE_CONSUMER, PAGE_GENERIC_DESKTOP,
-    PAGE_KEYBOARD, modifier_bit,
+    APPLE_TOP_CASE_BRIGHTNESS_DOWN, APPLE_TOP_CASE_BRIGHTNESS_UP, AuxiliaryReport,
+    CONSUMER_DISPLAY_BRIGHTNESS_DECREMENT, CONSUMER_DISPLAY_BRIGHTNESS_INCREMENT, HidReport,
+    KEY_CAPS_LOCK, KEY_ESCAPE, KeyboardReport, MOD_LEFT_CTRL, PAGE_APPLE_VENDOR_KEYBOARD,
+    PAGE_APPLE_VENDOR_TOP_CASE, PAGE_CONSUMER, PAGE_GENERIC_DESKTOP, PAGE_KEYBOARD, modifier_bit,
 };
 use std::time::{Duration, Instant};
 
@@ -30,6 +32,8 @@ struct CapsState {
 
 pub struct Remapper {
     alone_timeout: Duration,
+    /// Value of macOS' "Use F1, F2, etc. keys as standard function keys".
+    standard_function_keys: bool,
     caps: Option<CapsState>,
     physical_modifiers: u8,
     keyboard: KeyboardReport,
@@ -37,12 +41,16 @@ pub struct Remapper {
     apple_top_case: AuxiliaryReport,
     apple_keyboard: AuxiliaryReport,
     generic_desktop: AuxiliaryReport,
+    /// Translations currently emitted, keyed by the physical usage. Release
+    /// always undoes exactly what press produced, even if `fn` changes between.
+    translated: Vec<(PackedUsage, PackedUsage)>,
 }
 
 impl Remapper {
-    pub fn new(alone_timeout: Duration) -> Self {
+    pub fn new(alone_timeout: Duration, standard_function_keys: bool) -> Self {
         Self {
             alone_timeout,
+            standard_function_keys,
             caps: None,
             physical_modifiers: 0,
             keyboard: KeyboardReport::default(),
@@ -50,6 +58,7 @@ impl Remapper {
             apple_top_case: AuxiliaryReport::default(),
             apple_keyboard: AuxiliaryReport::default(),
             generic_desktop: AuxiliaryReport::default(),
+            translated: Vec::new(),
         }
     }
 
@@ -62,12 +71,15 @@ impl Remapper {
     }
 
     /// Process a single raw HID input event from a seized physical keyboard.
+    ///
+    /// `map` carries the `fn` tables published by that keyboard's macOS driver.
     pub fn handle_event(
         &mut self,
         usage_page: u32,
         usage: u32,
         pressed: bool,
         now: Instant,
+        map: &FnUsageMap,
     ) -> Vec<Action> {
         let mut actions = Vec::new();
         if usage == 0 || usage > u16::MAX as u32 {
@@ -95,8 +107,48 @@ impl Remapper {
                     }
                 }
 
+                // The keyboard's own driver tables describe what `fn` chords and
+                // the top row mean. Seizing the device bypasses that driver
+                // (which is why the top row arrives as plain F-keys), so replay
+                // its tables here instead of assuming a particular layout.
+                let source = pack(PAGE_KEYBOARD, usage);
+
+                // A key that one of the driver tables owns is translated on
+                // press and always released through the same path, so a change
+                // of `fn` state mid-hold cannot leave it stuck.
+                let translatable = map.function(source).is_some() || map.keyboard(source).is_some();
+
+                if translatable {
+                    if !pressed {
+                        if !self.release_translated(source, &mut actions)
+                            && self.keyboard.keys.erase(usage_u16)
+                        {
+                            actions.push(Action::Send(HidReport::Keyboard(self.keyboard)));
+                        }
+                        return actions;
+                    }
+
+                    // `fn` + key: Home/End/Page Up/Page Down/Forward Delete.
+                    if self.fn_held(map)
+                        && let Some(target) = map.keyboard(source)
+                    {
+                        self.press_translated(source, target, &mut actions);
+                        return actions;
+                    }
+
+                    // Top row: media key, or plain F-key, depending on the
+                    // "standard function keys" setting (which inverts `fn`).
+                    if let Some(target) = map.function(source) {
+                        if self.standard_function_keys == self.fn_held(map) {
+                            self.press_translated(source, target, &mut actions);
+                        } else if self.keyboard.keys.insert(usage_u16) {
+                            actions.push(Action::Send(HidReport::Keyboard(self.keyboard)));
+                        }
+                        return actions;
+                    }
+                }
+
                 let changed = if let Some(bit) = modifier_bit(usage_u16) {
-                    let prev = self.physical_modifiers;
                     if pressed {
                         self.physical_modifiers |= bit;
                     } else {
@@ -105,7 +157,7 @@ impl Remapper {
                     let new_eff = self.effective_modifiers();
                     let diff = new_eff != self.keyboard.modifiers;
                     self.keyboard.modifiers = new_eff;
-                    diff || prev != self.physical_modifiers && diff
+                    diff
                 } else if pressed {
                     self.keyboard.keys.insert(usage_u16)
                 } else {
@@ -187,6 +239,115 @@ impl Remapper {
         actions
     }
 
+    /// Emit a driver-table translation and remember it for its release.
+    fn press_translated(
+        &mut self,
+        source: PackedUsage,
+        target: PackedUsage,
+        actions: &mut Vec<Action>,
+    ) {
+        // Ignore key-repeat / duplicate down events.
+        if self.translated.iter().any(|(held, _)| *held == source) {
+            return;
+        }
+        self.translated.push((source, target));
+        self.emit_usage(target, true, actions);
+    }
+
+    /// Release the translation recorded for `source`; false if there is none.
+    fn release_translated(&mut self, source: PackedUsage, actions: &mut Vec<Action>) -> bool {
+        let Some(index) = self.translated.iter().position(|(held, _)| *held == source) else {
+            return false;
+        };
+        let (_, target) = self.translated.remove(index);
+        self.emit_usage(target, false, actions);
+        true
+    }
+
+    fn fn_held(&self, map: &FnUsageMap) -> bool {
+        map.fn_page() == PAGE_APPLE_VENDOR_TOP_CASE as u16
+            && self.apple_top_case.keys.contains(map.fn_usage())
+    }
+
+    /// Press or release a packed `(page, usage)` on the report that page lives in.
+    fn emit_usage(&mut self, packed: PackedUsage, pressed: bool, actions: &mut Vec<Action>) {
+        // Apple's driver maps F1/F2 to AppleVendorTopCase brightness usages, but
+        // macOS ignores those from a virtual keyboard. Post the consumer-page
+        // equivalents instead, as Karabiner does.
+        let packed = match packed {
+            p if p
+                == pack(
+                    PAGE_APPLE_VENDOR_TOP_CASE,
+                    APPLE_TOP_CASE_BRIGHTNESS_UP as u32,
+                ) =>
+            {
+                pack(PAGE_CONSUMER, CONSUMER_DISPLAY_BRIGHTNESS_INCREMENT as u32)
+            }
+            p if p
+                == pack(
+                    PAGE_APPLE_VENDOR_TOP_CASE,
+                    APPLE_TOP_CASE_BRIGHTNESS_DOWN as u32,
+                ) =>
+            {
+                pack(PAGE_CONSUMER, CONSUMER_DISPLAY_BRIGHTNESS_DECREMENT as u32)
+            }
+            other => other,
+        };
+
+        let page = (packed >> 16) as u32;
+        let usage = (packed & 0xFFFF) as u16;
+
+        let (changed, report) = match page {
+            PAGE_KEYBOARD => (
+                if pressed {
+                    self.keyboard.keys.insert(usage)
+                } else {
+                    self.keyboard.keys.erase(usage)
+                },
+                HidReport::Keyboard(self.keyboard),
+            ),
+            PAGE_CONSUMER => (
+                if pressed {
+                    self.consumer.keys.insert(usage)
+                } else {
+                    self.consumer.keys.erase(usage)
+                },
+                HidReport::Consumer(self.consumer),
+            ),
+            PAGE_APPLE_VENDOR_TOP_CASE => (
+                if pressed {
+                    self.apple_top_case.keys.insert(usage)
+                } else {
+                    self.apple_top_case.keys.erase(usage)
+                },
+                HidReport::AppleVendorTopCase(self.apple_top_case),
+            ),
+            PAGE_APPLE_VENDOR_KEYBOARD => (
+                if pressed {
+                    self.apple_keyboard.keys.insert(usage)
+                } else {
+                    self.apple_keyboard.keys.erase(usage)
+                },
+                HidReport::AppleVendorKeyboard(self.apple_keyboard),
+            ),
+            PAGE_GENERIC_DESKTOP => (
+                if pressed {
+                    self.generic_desktop.keys.insert(usage)
+                } else {
+                    self.generic_desktop.keys.erase(usage)
+                },
+                HidReport::GenericDesktop(self.generic_desktop),
+            ),
+            // Unknown destination page: drop rather than fall back to the raw
+            // key, which would defeat the translation entirely.
+            _ => return,
+        };
+
+        if changed {
+            actions.push(Action::Send(report));
+        }
+    }
+
     fn handle_caps_lock(&mut self, pressed: bool, now: Instant, actions: &mut Vec<Action>) {
         if pressed {
             if self.caps.is_some() {
@@ -221,6 +382,7 @@ impl Remapper {
         self.caps = None;
         self.physical_modifiers = 0;
         self.keyboard = KeyboardReport::default();
+        self.translated.clear();
         self.consumer.keys.clear();
         self.apple_top_case.keys.clear();
         self.apple_keyboard.keys.clear();
@@ -252,12 +414,37 @@ mod tests {
 
     const KEY_C: u32 = 0x06;
 
+    /// The tables this Mac's built-in keyboard publishes.
+    const FUNCTIONS: &str = "0x0007003a,0x00ff0005,0x0007003b,0x00ff0004,0x0007003c,0xff010010,0x0007003d,0x000c0221,0x0007003e,0x000c00cf,0x0007003f,0x0001009b,0x00070040,0x000c00b4,0x00070041,0x000c00cd,0x00070042,0x000c00b3,0x00070043,0x000c00e2,0x00070044,0x000c00ea,0x00070045,0x000c00e9";
+    const FN_KEYBOARD: &str = "0x00070050,0x0007004a,0x00070052,0x0007004b,0x0007002a,0x0007004c,0x0007004f,0x0007004d,0x00070051,0x0007004e,0x00070028,0x00070058";
+
+    const F2: u32 = 0x3B;
+    const F3: u32 = 0x3C;
+    const F11: u32 = 0x44;
+    const LEFT_ARROW: u32 = 0x50;
+    const FN: u32 = 0x03;
+    const HOME: u16 = 0x4A;
+
+    fn apple_map() -> FnUsageMap {
+        FnUsageMap::from_parts(Some(FUNCTIONS), Some(FN_KEYBOARD), Some(0xFF), Some(3))
+    }
+
+    fn press_fn(r: &mut Remapper, t: Instant) {
+        r.handle_event(PAGE_APPLE_VENDOR_TOP_CASE, FN, true, t, &apple_map());
+    }
+
     #[test]
     fn quick_tap_emits_escape() {
-        let mut r = Remapper::new(Duration::from_millis(500));
+        let mut r = Remapper::new(Duration::from_millis(500), false);
         let t0 = Instant::now();
 
-        let down = r.handle_event(PAGE_KEYBOARD, KEY_CAPS_LOCK as u32, true, t0);
+        let down = r.handle_event(
+            PAGE_KEYBOARD,
+            KEY_CAPS_LOCK as u32,
+            true,
+            t0,
+            &FnUsageMap::default(),
+        );
         assert_eq!(down.len(), 1);
         match down[0] {
             Action::Send(HidReport::Keyboard(kb)) => assert_eq!(kb.modifiers, MOD_LEFT_CTRL),
@@ -269,6 +456,7 @@ mod tests {
             KEY_CAPS_LOCK as u32,
             false,
             t0 + Duration::from_millis(80),
+            &FnUsageMap::default(),
         );
         assert_eq!(up.len(), 2);
         match up[0] {
@@ -280,15 +468,22 @@ mod tests {
 
     #[test]
     fn hold_past_timeout_does_not_emit_escape() {
-        let mut r = Remapper::new(Duration::from_millis(500));
+        let mut r = Remapper::new(Duration::from_millis(500), false);
         let t0 = Instant::now();
 
-        r.handle_event(PAGE_KEYBOARD, KEY_CAPS_LOCK as u32, true, t0);
+        r.handle_event(
+            PAGE_KEYBOARD,
+            KEY_CAPS_LOCK as u32,
+            true,
+            t0,
+            &FnUsageMap::default(),
+        );
         let up = r.handle_event(
             PAGE_KEYBOARD,
             KEY_CAPS_LOCK as u32,
             false,
             t0 + Duration::from_millis(600),
+            &FnUsageMap::default(),
         );
         assert_eq!(up.len(), 1);
         assert!(matches!(up[0], Action::Send(HidReport::Keyboard(_))));
@@ -296,16 +491,23 @@ mod tests {
 
     #[test]
     fn chord_with_other_key_is_ctrl_only() {
-        let mut r = Remapper::new(Duration::from_millis(500));
+        let mut r = Remapper::new(Duration::from_millis(500), false);
         let t0 = Instant::now();
 
-        r.handle_event(PAGE_KEYBOARD, KEY_CAPS_LOCK as u32, true, t0);
+        r.handle_event(
+            PAGE_KEYBOARD,
+            KEY_CAPS_LOCK as u32,
+            true,
+            t0,
+            &FnUsageMap::default(),
+        );
 
         let c_down = r.handle_event(
             PAGE_KEYBOARD,
             KEY_C,
             true,
             t0 + Duration::from_millis(20),
+            &FnUsageMap::default(),
         );
         match c_down[0] {
             Action::Send(HidReport::Keyboard(kb)) => {
@@ -320,6 +522,7 @@ mod tests {
             KEY_C,
             false,
             t0 + Duration::from_millis(50),
+            &FnUsageMap::default(),
         );
 
         let caps_up = r.handle_event(
@@ -327,6 +530,7 @@ mod tests {
             KEY_CAPS_LOCK as u32,
             false,
             t0 + Duration::from_millis(80),
+            &FnUsageMap::default(),
         );
         // Only Left Ctrl up; NO Escape tap!
         assert_eq!(caps_up.len(), 1);
@@ -338,16 +542,23 @@ mod tests {
 
     #[test]
     fn physical_left_ctrl_preserved_when_caps_released() {
-        let mut r = Remapper::new(Duration::from_millis(500));
+        let mut r = Remapper::new(Duration::from_millis(500), false);
         let t0 = Instant::now();
 
         // Hold physical Left Control, then press & release Caps Lock.
-        r.handle_event(PAGE_KEYBOARD, KEY_LEFT_CTRL as u32, true, t0);
+        r.handle_event(
+            PAGE_KEYBOARD,
+            KEY_LEFT_CTRL as u32,
+            true,
+            t0,
+            &FnUsageMap::default(),
+        );
         let caps_down = r.handle_event(
             PAGE_KEYBOARD,
             KEY_CAPS_LOCK as u32,
             true,
             t0 + Duration::from_millis(10),
+            &FnUsageMap::default(),
         );
         // Left Control is already set, so no redundant report needed.
         assert!(caps_down.is_empty());
@@ -357,9 +568,142 @@ mod tests {
             KEY_CAPS_LOCK as u32,
             false,
             t0 + Duration::from_millis(40),
+            &FnUsageMap::default(),
         );
         // Physical Left Control is still held!
         assert_eq!(r.effective_modifiers(), MOD_LEFT_CTRL);
         assert!(matches!(caps_up.last(), Some(Action::TapEscape(_))));
+    }
+
+    #[test]
+    fn top_row_follows_the_keyboards_driver_table() {
+        let mut r = Remapper::new(Duration::from_millis(500), false);
+        let t0 = Instant::now();
+
+        // This Mac maps F2 to AppleVendorTopCase brightness up, which is posted
+        // as the consumer-page brightness key (what a virtual keyboard accepts).
+        let down = r.handle_event(PAGE_KEYBOARD, F2, true, t0, &apple_map());
+        match down.as_slice() {
+            [Action::Send(HidReport::Consumer(report))] => {
+                assert!(report.keys.contains(CONSUMER_DISPLAY_BRIGHTNESS_INCREMENT));
+            }
+            other => panic!("expected brightness up, got {other:?}"),
+        }
+
+        let up = r.handle_event(PAGE_KEYBOARD, F2, false, t0, &apple_map());
+        match up.as_slice() {
+            [Action::Send(HidReport::Consumer(report))] => {
+                assert!(!report.keys.contains(CONSUMER_DISPLAY_BRIGHTNESS_INCREMENT));
+            }
+            other => panic!("expected brightness up release, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn top_row_follows_the_driver_table_across_pages() {
+        let mut r = Remapper::new(Duration::from_millis(500), false);
+        let t0 = Instant::now();
+
+        // F3 -> AppleVendorKeyboard expose_all (Mission Control).
+        let mission_control = r.handle_event(PAGE_KEYBOARD, F3, true, t0, &apple_map());
+        match mission_control.as_slice() {
+            [Action::Send(HidReport::AppleVendorKeyboard(report))] => {
+                assert!(report.keys.contains(0x0010));
+            }
+            other => panic!("expected Mission Control, got {other:?}"),
+        }
+
+        // F11 -> Consumer volume decrement.
+        let volume = r.handle_event(PAGE_KEYBOARD, F11, true, t0, &apple_map());
+        match volume.as_slice() {
+            [Action::Send(HidReport::Consumer(report))] => {
+                assert!(report.keys.contains(0x00EA));
+            }
+            other => panic!("expected volume down, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn top_row_is_raw_while_fn_is_held() {
+        let mut r = Remapper::new(Duration::from_millis(500), false);
+        let t0 = Instant::now();
+        press_fn(&mut r, t0);
+
+        let down = r.handle_event(PAGE_KEYBOARD, F2, true, t0, &apple_map());
+        match down.as_slice() {
+            [Action::Send(HidReport::Keyboard(report))] => assert!(report.keys.contains(F2 as u16)),
+            other => panic!("expected raw F2, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn top_row_is_raw_when_standard_function_keys_is_enabled() {
+        let mut r = Remapper::new(Duration::from_millis(500), true);
+        let down = r.handle_event(PAGE_KEYBOARD, F2, true, Instant::now(), &apple_map());
+        match down.as_slice() {
+            [Action::Send(HidReport::Keyboard(report))] => assert!(report.keys.contains(F2 as u16)),
+            other => panic!("expected raw F2, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn top_row_media_applies_to_fn_when_standard_function_keys_is_enabled() {
+        let mut r = Remapper::new(Duration::from_millis(500), true);
+        let t0 = Instant::now();
+        press_fn(&mut r, t0);
+
+        let down = r.handle_event(PAGE_KEYBOARD, F2, true, t0, &apple_map());
+        match down.as_slice() {
+            [Action::Send(HidReport::Consumer(report))] => {
+                assert!(report.keys.contains(CONSUMER_DISPLAY_BRIGHTNESS_INCREMENT));
+            }
+            other => panic!("expected brightness up, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn keyboard_without_a_driver_table_passes_f_keys_through() {
+        let mut r = Remapper::new(Duration::from_millis(500), false);
+        let down = r.handle_event(
+            PAGE_KEYBOARD,
+            F2,
+            true,
+            Instant::now(),
+            &FnUsageMap::default(),
+        );
+        match down.as_slice() {
+            [Action::Send(HidReport::Keyboard(report))] => assert!(report.keys.contains(F2 as u16)),
+            other => panic!("expected raw F2, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn fn_arrow_follows_the_driver_table() {
+        let mut r = Remapper::new(Duration::from_millis(500), false);
+        let t0 = Instant::now();
+        press_fn(&mut r, t0);
+
+        let down = r.handle_event(PAGE_KEYBOARD, LEFT_ARROW, true, t0, &apple_map());
+        match down.as_slice() {
+            [Action::Send(HidReport::Keyboard(report))] => assert!(report.keys.contains(HOME)),
+            other => panic!("expected Home, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn top_row_release_undoes_the_press_even_if_fn_changes_in_between() {
+        let mut r = Remapper::new(Duration::from_millis(500), false);
+        let t0 = Instant::now();
+
+        r.handle_event(PAGE_KEYBOARD, F11, true, t0, &apple_map());
+        press_fn(&mut r, t0);
+
+        let up = r.handle_event(PAGE_KEYBOARD, F11, false, t0, &apple_map());
+        match up.as_slice() {
+            [Action::Send(HidReport::Consumer(report))] => {
+                assert!(!report.keys.contains(0x00EA));
+            }
+            other => panic!("expected volume down release, got {other:?}"),
+        }
     }
 }

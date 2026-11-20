@@ -1,3 +1,4 @@
+mod fnmap;
 mod hid;
 mod iokit;
 mod remap;

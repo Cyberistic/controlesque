@@ -10,6 +10,7 @@
 
 #![allow(non_camel_case_types, non_upper_case_globals)]
 
+use crate::fnmap::FnUsageMap;
 use crate::hid::HidReport;
 use crate::remap::{Action, Remapper, escape_tap_reports};
 use crate::vhidd::{VIRTUAL_PRODUCT_ID, VIRTUAL_VENDOR_ID, VirtualKeyboardClient};
@@ -66,16 +67,29 @@ const kIOReturnSuccess: IOReturn = 0;
 const kIOReturnNotPermitted: IOReturn = 0xe000_02e2u32 as i32;
 const kIOHIDOptionsTypeNone: IOOptionBits = 0;
 const kIOHIDOptionsTypeSeizeDevice: IOOptionBits = 1;
+const K_IO_REGISTRY_ITERATE_RECURSIVELY: IOOptionBits = 1;
 
 #[link(name = "CoreFoundation", kind = "framework")]
 unsafe extern "C" {
     static kCFRunLoopDefaultMode: CFStringRef;
+    static kCFPreferencesAnyApplication: CFStringRef;
+    static kCFPreferencesCurrentUser: CFStringRef;
+    static kCFPreferencesAnyHost: CFStringRef;
 
     fn CFRetain(cf: CFTypeRef) -> CFTypeRef;
     fn CFRelease(cf: CFTypeRef);
     fn CFGetTypeID(cf: CFTypeRef) -> CFTypeID;
     fn CFStringGetTypeID() -> CFTypeID;
     fn CFNumberGetTypeID() -> CFTypeID;
+    fn CFBooleanGetTypeID() -> CFTypeID;
+    fn CFBooleanGetValue(boolean: CFTypeRef) -> Boolean;
+
+    fn CFPreferencesCopyValue(
+        key: CFStringRef,
+        application_id: CFStringRef,
+        user_name: CFStringRef,
+        host_name: CFStringRef,
+    ) -> CFTypeRef;
 
     fn CFStringCreateWithCString(
         alloc: CFAllocatorRef,
@@ -140,6 +154,13 @@ unsafe extern "C" {
         entry: io_registry_entry_t,
         entry_id: *mut u64,
     ) -> kern_return_t;
+    fn IORegistryEntrySearchCFProperty(
+        entry: io_registry_entry_t,
+        plane: *const c_char,
+        key: CFStringRef,
+        allocator: CFAllocatorRef,
+        options: IOOptionBits,
+    ) -> CFTypeRef;
 
     fn IOHIDDeviceCreate(allocator: CFAllocatorRef, service: io_service_t) -> IOHIDDeviceRef;
     fn IOHIDDeviceOpen(device: IOHIDDeviceRef, options: IOOptionBits) -> IOReturn;
@@ -249,6 +270,116 @@ fn device_i64_prop(device: IOHIDDeviceRef, key: &str) -> Option<i64> {
     if ok != 0 { Some(out) } else { None }
 }
 
+/// macOS' "Use F1, F2, etc. keys as standard function keys" preference.
+///
+/// The built-in keyboard's driver reads this to decide whether the top row
+/// sends F1..F12 or the media keys. Seizing the device bypasses that driver, so
+/// the remapper has to honor the same setting.
+fn use_fkeys_as_standard_function_keys() -> bool {
+    let key = cf_string("com.apple.keyboard.fnState");
+    let value = unsafe {
+        CFPreferencesCopyValue(
+            key.0,
+            kCFPreferencesAnyApplication,
+            kCFPreferencesCurrentUser,
+            kCFPreferencesAnyHost,
+        )
+    };
+    if value.is_null() {
+        return false;
+    }
+    let value = CfOwned(value);
+    let type_id = unsafe { CFGetTypeID(value.0) };
+    if type_id == unsafe { CFBooleanGetTypeID() } {
+        return unsafe { CFBooleanGetValue(value.0) } != 0;
+    }
+    if type_id == unsafe { CFNumberGetTypeID() } {
+        let mut out: i64 = 0;
+        let ok = unsafe {
+            CFNumberGetValue(
+                value.0,
+                kCFNumberSInt64Type,
+                (&mut out as *mut i64).cast::<c_void>(),
+            )
+        };
+        return ok != 0 && out != 0;
+    }
+    false
+}
+
+/// Read a property from the service or any of its registry descendants.
+fn descendant_property(service: io_service_t, key: &str) -> Option<CfOwned> {
+    let cf_key = cf_string(key);
+    let plane = CString::new("IOService").ok()?;
+    let prop = unsafe {
+        IORegistryEntrySearchCFProperty(
+            service,
+            plane.as_ptr(),
+            cf_key.0,
+            ptr::null(),
+            K_IO_REGISTRY_ITERATE_RECURSIVELY,
+        )
+    };
+    if prop.is_null() {
+        None
+    } else {
+        Some(CfOwned(prop))
+    }
+}
+
+fn property_string(service: io_service_t, key: &str) -> Option<String> {
+    let prop = descendant_property(service, key)?;
+    if unsafe { CFGetTypeID(prop.0) } != unsafe { CFStringGetTypeID() } {
+        return None;
+    }
+    let mut buf = [0u8; 2048];
+    let ok = unsafe {
+        CFStringGetCString(
+            prop.0,
+            buf.as_mut_ptr().cast::<c_char>(),
+            buf.len() as CFIndex,
+            kCFStringEncodingUTF8,
+        )
+    };
+    if ok == 0 {
+        return None;
+    }
+    let cstr = unsafe { CStr::from_ptr(buf.as_ptr().cast::<c_char>()) };
+    Some(cstr.to_string_lossy().into_owned())
+}
+
+fn property_u16(service: io_service_t, key: &str) -> Option<u16> {
+    let prop = descendant_property(service, key)?;
+    if unsafe { CFGetTypeID(prop.0) } != unsafe { CFNumberGetTypeID() } {
+        return None;
+    }
+    let mut out: i64 = 0;
+    let ok = unsafe {
+        CFNumberGetValue(
+            prop.0,
+            kCFNumberSInt64Type,
+            (&mut out as *mut i64).cast::<c_void>(),
+        )
+    };
+    if ok == 0 {
+        return None;
+    }
+    u16::try_from(out).ok()
+}
+
+/// The `fn` tables Apple's keyboard driver publishes for this device.
+///
+/// They live on the driver's event service, a registry descendant of the
+/// `IOHIDDevice` we seize, so they are read before the device is opened.
+fn read_fn_usage_map(service: io_service_t) -> FnUsageMap {
+    FnUsageMap::from_parts(
+        property_string(service, "FnFunctionUsageMap").as_deref(),
+        property_string(service, "FnKeyboardUsageMap").as_deref(),
+        property_u16(service, "FnModifierUsagePage"),
+        property_u16(service, "FnModifierUsage"),
+    )
+}
+
 fn is_karabiner_virtual_keyboard(device: IOHIDDeviceRef) -> bool {
     let vid = device_i64_prop(device, "VendorID").unwrap_or(-1);
     let pid = device_i64_prop(device, "ProductID").unwrap_or(-1);
@@ -275,6 +406,8 @@ struct SeizeContext {
     seized_devices: HashMap<u64, IOHIDDeviceRef>,
     /// Devices waiting for Input Monitoring permission to be granted.
     pending_devices: HashMap<u64, IOHIDDeviceRef>,
+    /// `fn` tables per device, keyed by its `IOHIDDeviceRef`.
+    fn_maps: HashMap<usize, FnUsageMap>,
     verbose: bool,
 }
 
@@ -320,6 +453,9 @@ extern "C" fn on_service_matched(refcon: *mut c_void, iterator: io_iterator_t) {
             continue;
         }
 
+        // Read the driver's `fn` tables before the service handle is released.
+        let fn_map = read_fn_usage_map(service);
+        let has_fn_tables = !fn_map.is_empty();
         let device = unsafe { IOHIDDeviceCreate(ptr::null(), service) };
         unsafe { IOObjectRelease(service) };
         if device.is_null() {
@@ -340,6 +476,8 @@ extern "C" fn on_service_matched(refcon: *mut c_void, iterator: io_iterator_t) {
             continue;
         }
 
+        ctx.fn_maps.insert(device as usize, fn_map);
+
         let kr = unsafe { IOHIDDeviceOpen(device, kIOHIDOptionsTypeSeizeDevice) };
         if kr == kIOReturnNotPermitted {
             eprintln!(
@@ -353,6 +491,7 @@ extern "C" fn on_service_matched(refcon: *mut c_void, iterator: io_iterator_t) {
             eprintln!(
                 "[controlesque] failed to seize {product} (0x{vid:04x}:0x{pid:04x}): IOReturn=0x{kr:08x}"
             );
+            ctx.fn_maps.remove(&(device as usize));
             unsafe { CFRelease(device) };
             continue;
         }
@@ -364,7 +503,9 @@ extern "C" fn on_service_matched(refcon: *mut c_void, iterator: io_iterator_t) {
 
         ctx.seized_devices.insert(reg_id, device);
         eprintln!(
-            "[controlesque] seized keyboard: {product} (0x{vid:04x}:0x{pid:04x}, id={reg_id})"
+            "[controlesque] seized keyboard: {product} (0x{vid:04x}:0x{pid:04x}, id={reg_id}, \
+             fn tables: {})",
+            if has_fn_tables { "yes" } else { "none" }
         );
     }
 }
@@ -383,10 +524,12 @@ extern "C" fn on_service_terminated(refcon: *mut c_void, iterator: io_iterator_t
         unsafe { IOObjectRelease(service) };
 
         if let Some(device) = ctx.pending_devices.remove(&reg_id) {
+            ctx.fn_maps.remove(&(device as usize));
             unsafe { CFRelease(device) };
         }
 
         if let Some(device) = ctx.seized_devices.remove(&reg_id) {
+            ctx.fn_maps.remove(&(device as usize));
             let product =
                 device_string_prop(device, "Product").unwrap_or_else(|| "<unknown>".into());
             eprintln!("[controlesque] keyboard removed: {product} (id={reg_id})");
@@ -412,7 +555,7 @@ extern "C" fn on_service_terminated(refcon: *mut c_void, iterator: io_iterator_t
 extern "C" fn on_input_value(
     context: *mut c_void,
     _result: IOReturn,
-    _sender: *mut c_void,
+    sender: *mut c_void,
     value: IOHIDValueRef,
 ) {
     // Guard against multi-byte vendor descriptor values that cannot fit in CFIndex.
@@ -437,9 +580,11 @@ extern "C" fn on_input_value(
     let pressed = unsafe { IOHIDValueGetIntegerValue(value) != 0 };
 
     let ctx = unsafe { &mut *context.cast::<SeizeContext>() };
+    let fallback = FnUsageMap::default();
+    let map = ctx.fn_maps.get(&(sender as usize)).unwrap_or(&fallback);
     let actions = ctx
         .remapper
-        .handle_event(usage_page, usage, pressed, Instant::now());
+        .handle_event(usage_page, usage, pressed, Instant::now(), map);
     if !actions.is_empty() {
         ctx.emit_actions(actions);
     }
@@ -452,11 +597,17 @@ pub fn run_seize_loop(
     running: &AtomicBool,
     verbose: bool,
 ) -> Result<(), String> {
+    let standard_function_keys = use_fkeys_as_standard_function_keys();
+    if verbose {
+        eprintln!("[controlesque] use F1–F12 as standard function keys: {standard_function_keys}");
+    }
+
     let mut ctx = Box::new(SeizeContext {
-        remapper: Remapper::new(alone_timeout),
+        remapper: Remapper::new(alone_timeout, standard_function_keys),
         vhidd,
         seized_devices: HashMap::new(),
         pending_devices: HashMap::new(),
+        fn_maps: HashMap::new(),
         verbose,
     });
     let ctx_ptr = (&mut *ctx as *mut SeizeContext).cast::<c_void>();
